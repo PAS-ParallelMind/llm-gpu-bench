@@ -1,13 +1,14 @@
 """Run the GEMM grid sweep, derive C_peak / B_peak, dump JSON.
 
-    python3 run.py --dtypes bf16             # whole grid, bf16 (cuBLAS)
+    python3 run.py --dtypes bf16             # whole grid, bf16 (torch F.linear)
     python3 run.py --dtypes mxfp4            # w4a16 mxfp4 (vLLM Marlin)
     python3 run.py --shapes k2048_n4096 --dtypes bf16
 
-bf16/fp16 go through cuBLASLt; mxfp4 goes through the vLLM Marlin w4a16 kernel
-(needs vLLM) with its own byte model. Run mxfp4 separately from bf16/fp16 — they
-have different kernels, ceilings, and byte models, so different output files.
-Needs torch + a CUDA GPU.
+bf16/fp16 go through torch's F.linear (torch picks the GEMM backend —
+cuBLAS / cuBLASLt / CUTLASS — per shape); mxfp4 goes through the vLLM Marlin w4a16
+kernel (needs vLLM) with its own byte model. Run mxfp4 separately from bf16/fp16 —
+different kernels, ceilings, and byte models, so different output files. Needs
+torch + a CUDA GPU.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--dtypes", nargs="+", default=["bf16", "fp16"],
-                    help="bf16/fp16 (cuBLAS) or mxfp4 (Marlin w4a16); not mixed.")
+                    help="bf16/fp16 (torch F.linear) or mxfp4 (Marlin w4a16); not mixed.")
     ap.add_argument("--shapes", nargs="+", default=None,
                     help="Subset of SHAPES keys (default: all).")
     ap.add_argument("--iters", type=int, default=100)
@@ -50,12 +51,12 @@ def main() -> None:
 
     shapes = SHAPES if not args.shapes else {k: SHAPES[k] for k in args.shapes}
 
-    cublas = [d for d in args.dtypes if d in ("bf16", "fp16")]
+    fp_dtypes = [d for d in args.dtypes if d in ("bf16", "fp16")]
     quant = [d for d in args.dtypes if d == "mxfp4"]
-    if cublas and quant:
+    if fp_dtypes and quant:
         raise SystemExit("run mxfp4 separately from bf16/fp16 — different kernel, "
                          "ceilings, and byte model (different output files).")
-    if not cublas and not quant:
+    if not fp_dtypes and not quant:
         raise SystemExit(f"unknown --dtypes {args.dtypes}; use bf16, fp16, or mxfp4.")
 
     if quant:
@@ -72,16 +73,16 @@ def main() -> None:
         lib = {"vllm": vllm.__version__}          # the Marlin kernel ships in vLLM
         default_out = f"results/marlin_mxfp4_{props.name.replace(' ', '_')}.json"
     else:
-        print("\n== gemm (cuBLAS) ==")
-        recs = run_gemm_sweep(shapes, DEFAULT_MS, cublas,
+        print("\n== gemm (torch F.linear) ==")
+        recs = run_gemm_sweep(shapes, DEFAULT_MS, fp_dtypes,
                               device=dev, iters=args.iters, warmup=args.warmup)
         c_peak = derive_c_peak(recs)
         # B_peak: best memory throughput the sweep itself reached (small-M, large-
         # weight GEMMs are HBM-read-bound), so no separate bandwidth probe needed.
         b_peak = max(r.gbps for r in recs)
         roofline_residual(recs, c_peak, b_peak)
-        scheme, bytes_model = "+".join(cublas), {"w": 2.0, "a": 2.0, "o": 2.0}
-        lib = {"torch": torch.__version__}        # cuBLASLt ships in torch
+        scheme, bytes_model = "+".join(fp_dtypes), {"w": 2.0, "a": 2.0, "o": 2.0}
+        lib = {"torch": torch.__version__}        # the F.linear GEMM ships in torch
         default_out = f"results/gemm_{props.name.replace(' ', '_')}.json"
 
     for dt, (tf, where) in c_peak.items():

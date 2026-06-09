@@ -5,7 +5,7 @@ predict.py for the latency using only the model-agnostic grid. Reports
 |predicted - measured| / measured. A grid keyed on no model should still predict
 every model's shapes.
 
-    python3 validate_predict.py                  # bf16 (cuBLAS) grid
+    python3 validate_predict.py                  # bf16 (torch F.linear) grid
     python3 validate_predict.py --scheme mxfp4   # mxfp4 w4a16 (Marlin) grid
 """
 from __future__ import annotations

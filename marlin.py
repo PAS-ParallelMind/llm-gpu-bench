@@ -9,7 +9,7 @@ a bf16 matmul. So the FLOPs match bf16 but the weight read is ~3.8x lighter:
 
 That lighter weight read moves the roofline ridge to a much smaller M, so decode
 is far more memory-efficient than bf16 — the whole point of w4a16. Compute is still
-bf16 tensor cores but with dequant overhead, so achievable C_peak < cuBLAS.
+bf16 tensor cores but with dequant overhead, so achievable C_peak < dense bf16.
 
 Reuses gemm.py's GemmRecord; dtype label is "mxfp4". The kernel call is vLLM's own
 tested path (rand_marlin_weight_mxfp4_like + apply_fp4_marlin_linear); we add only
@@ -21,7 +21,7 @@ from __future__ import annotations
 import torch
 
 from gemm import GemmRecord
-from timing import measure
+from timing import measure, progress
 from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
@@ -79,6 +79,7 @@ def run_marlin_sweep(
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     ws = marlin_make_workspace_new(dev)
     recs: list[GemmRecord] = []
+    pbar = progress(len(shapes) * len(Ms), "mxfp4")
     for name, (K, N) in shapes.items():
         qw, scales = make_mxfp4_weight(N, K, dev)
         warned = False
@@ -99,6 +100,7 @@ def run_marlin_sweep(
                           f"({str(e).splitlines()[0][:48]})")
                     warned = True
                 del x
+                pbar.update(1)
                 continue
             flops = 2 * M * N * K
             nbytes = marlin_bytes(M, K, N)
@@ -110,9 +112,12 @@ def run_marlin_sweep(
                 gbps=nbytes / sec / 1e9,
                 ai=flops / nbytes,
             ))
+            pbar.set_postfix_str(f"{name} M={M}")
+            pbar.update(1)
             del x
         del qw, scales
         torch.cuda.empty_cache()
+    pbar.close()
     return recs
 
 

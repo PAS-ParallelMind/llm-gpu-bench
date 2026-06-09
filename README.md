@@ -64,11 +64,12 @@ saw, across M = 1…4096 (`validate_predict.py`):
 
 - Most shapes (lmhead, qkv, o, most MoE) are **1–6%** across all M.
 - **Known floor — power-of-2 cliffs.** Grid points sit on tile-aligned ("lucky")
-  sizes; cuBLAS has kernel-selection dips at non-pow2 dims *between* them. e.g. at
+  sizes; torch's GEMM backend has kernel-selection dips at non-pow2 dims *between*
+  them. e.g. at
   K=2048, M=512: N=1024→0.54, **N=1536→0.37**, N=2048→0.64 — a V-notch the grid
   interpolates straight over. A non-pow2 dim landing in a transition-band
   (M≈256–1024) dip can carry **~50% error** (~1 in 6 non-pow2 shapes). This is
-  sub-octave and intrinsic to cuBLAS — not fixable by grid density; documented as
+  sub-octave and intrinsic to the kernel library — not fixable by grid density; documented as
   the accuracy floor.
 
 ## mxfp4 w4a16 (vLLM Marlin)
@@ -128,5 +129,5 @@ The sweep needs torch + a CUDA GPU (mxfp4 also needs vLLM); prediction does not.
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
 - Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** grids + predictor.
-- Next: fp16 (same cuBLASLt path), then **flash-attention** and **fusedMoE** — each a
+- Next: fp16 (same F.linear path), then **flash-attention** and **fusedMoE** — each a
   new op with its own shape descriptor feeding the same roofline ÷ efficiency split.

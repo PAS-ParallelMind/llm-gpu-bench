@@ -97,3 +97,22 @@ def measure(
         end.synchronize()
         samples.append(start.elapsed_time(end))
     return Timing.from_samples(samples)
+
+
+def progress(total: int, desc: str):
+    """A tqdm progress bar over `total` sweep configs; a no-op if tqdm is absent."""
+    try:
+        from tqdm import tqdm
+        return tqdm(total=total, desc=desc, unit="cfg")
+    except ImportError:
+        class _Null:
+            def update(self, n: int = 1):
+                pass
+
+            def set_postfix_str(self, s: str):
+                pass
+
+            def close(self):
+                pass
+
+        return _Null()
