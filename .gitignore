@@ -1,0 +1,11 @@
+# benchmark outputs
+results/
+
+# uv / venv (lives in-tree)
+vllm_env/
+.venv/
+
+# python caches
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

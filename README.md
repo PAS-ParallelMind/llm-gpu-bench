@@ -1,0 +1,132 @@
+# llm-gpu-bench
+
+A benchmark suite that characterises a GPU's **achievable** compute/memory
+throughput and turns it into **LLM inference latency predictions**. It measures
+the ceilings the GPU actually reaches (not datasheet peaks) and the *efficiency
+factor* of real kernel shapes, so a roofline model can predict latency for shapes
+it never measured.
+
+## Idea
+
+Latency of a GEMM (and, later, attention / MoE) is split into two measured pieces:
+
+    t = roofline(C_peak, B_peak) / efficiency(shape)
+
+1. **Ceilings** — `C_peak[dtype]` (achievable TFLOP/s, from the GEMM compute
+   plateau) and `B_peak` (achievable GB/s, from the same sweep's small-M,
+   large-weight points, which are HBM-read-bound). They set the floor
+   `t_roof = max(FLOPs / C_peak, Bytes / B_peak)`.
+2. **Efficiency factor** `efficiency = t_roof / t_measured ∈ (0,1]` — how close the
+   real kernel gets to the floor. This is what varies with shape, so it is what we
+   sample and interpolate.
+
+The challenge: (model, op, batch) shapes are unbounded — we can't measure them all.
+So we measure one **model-agnostic grid** per GPU and predict any shape by
+interpolating its efficiency factor to the nearest measured neighbourhood.
+
+## What the sweep found (bf16 GEMM, RTX 4090)
+
+For `y = x @ Wᵀ`, sweeping M (tokens) × K (contraction) × N (output), efficiency is
+low-dimensional and lives on physics axes, not raw (K,N):
+
+- **Decode (small M):** efficiency tracks the **weight footprint N·K** — a small
+  weight can't saturate HBM (eff ≈ 0.2), a big one does (eff ≈ 1.0).
+- **Prefill (large M):** efficiency tracks **K** (mainloop length): 0.88 (K=512) →
+  0.97 (K≥4096).
+- **Transition (M ≈ 64–256):** a ~10% efficiency sag where neither ceiling is
+  saturated. Jagged (wave quantization) — the irreducible hard region.
+
+Two approaches ruled out **by measurement**, not opinion:
+
+- An **analytic tile/wave-quant correction** (`ceil(M/Tm)·ceil(N/Tn)` vs SM count)
+  does *not* help — split-K / stream-K kernels redistribute work and defeat it.
+  Measure the transition, don't model it.
+- A **sparse grid + footprint↔K distance metric** worked but was fragile on
+  narrow-N shapes. A **dense grid + trilinear interpolation** is simpler *and* more
+  accurate, so that's what shipped.
+
+## The predictor
+
+- **Grid** (`gemm.py`) — a dense octave grid, K ∈ [128 … 16384], N ∈ [128 …
+  131072] (88 pairs) × an M-sweep [1 … 4096]. Model-agnostic: keyed on no model's
+  shapes. Real projections fall inside the hull (K∈[768,8192], N∈[1536,~201k]); N
+  reaches 131072 so lmhead is bracketed, not extrapolated.
+- **Predict** (`predict.py`) — `t = roofline / efficiency`, efficiency by trilinear
+  interpolation in (log M, log K, log N), clamped at the edges. Pure stdlib: no GPU
+  needed to predict.
+
+### Accuracy
+
+Validated on 10 real projections (gpt-oss-20b, Qwen3-Coder-30B) the grid never
+saw, across M = 1…4096 (`validate_predict.py`):
+
+    latency error:  median 2.7%   mean 4.8%
+
+- Most shapes (lmhead, qkv, o, most MoE) are **1–6%** across all M.
+- **Known floor — power-of-2 cliffs.** Grid points sit on tile-aligned ("lucky")
+  sizes; cuBLAS has kernel-selection dips at non-pow2 dims *between* them. e.g. at
+  K=2048, M=512: N=1024→0.54, **N=1536→0.37**, N=2048→0.64 — a V-notch the grid
+  interpolates straight over. A non-pow2 dim landing in a transition-band
+  (M≈256–1024) dip can carry **~50% error** (~1 in 6 non-pow2 shapes). This is
+  sub-octave and intrinsic to cuBLAS — not fixable by grid density; documented as
+  the accuracy floor.
+
+## mxfp4 w4a16 (vLLM Marlin)
+
+Same framework, second scheme: 4-bit weights (mxfp4 — 32-elem groups + E8M0 scale),
+bf16 activations. On Ada (no FP4 cores) Marlin dequantizes W→bf16 and runs a bf16
+matmul, so only the **byte model** changes — the weight read is ~3.8× lighter:
+
+    bytes = 0.53125·N·K  (4-bit weight + 1-byte scale/32)  +  2·(M·K + M·N)
+
+The predictor is unchanged; each scheme just carries its own ceilings and a
+`bytes_model` in the results JSON (`predict.py` reads it; bf16 defaults to 2/2/2).
+
+What the sweep found (RTX 4090):
+
+- **C_peak[mxfp4] ≈ 171 TFLOP/s** — same as bf16; dequant is fully hidden at large M.
+- **B_peak[mxfp4] ≈ 904 GB/s** effective weight-read — the biggest weights approach
+  HBM, but moderate ones run ~600 GB/s (dequant-limited); the efficiency factor
+  absorbs the shape dependence.
+- **~3× decode speedup vs bf16** (M ≲ 16), vanishing by M ≈ 1024 where both are
+  compute-bound on the same tensor cores. The lighter weight read moves the roofline
+  ridge down to small M — the whole point of w4a16.
+
+Accuracy on the 9 runnable real projections (`validate_predict.py --scheme mxfp4`):
+
+    latency error:  median 5.9%   mean 7.5%   p90 15%
+
+- **Marlin shape constraint:** it rejects dims where K and N are *both* only
+  64-aligned (e.g. gpt-oss moe_dn 2880×2880) — no valid tile config. The power-of-2
+  grid is unaffected; production pads such weights to marlin-friendly dims, and the
+  sweep skips unrunnable shapes rather than crash.
+
+## Files
+
+    timing.py             CUDA-event timing, L2 flush, robust stats     (torch)
+    gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
+    marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
+    run.py                sweep a scheme, derive ceilings, dump JSON      (torch)
+    predict.py            trilinear latency predictor (any scheme)       (stdlib)
+    validate_predict.py   predicted vs measured on real projections       (torch)
+    results/              grid JSON  (gemm_<gpu>.json, marlin_mxfp4_<gpu>.json)
+
+## Run
+
+Activate the env (torch + CUDA), then:
+
+    python run.py --dtypes bf16                  # bf16 grid → results/gemm_<gpu>.json
+    python run.py --dtypes mxfp4                 # mxfp4 w4a16 grid (Marlin)
+    python predict.py --shape 2880 5120          # predict latency vs M for K,N
+    python validate_predict.py                   # bf16 accuracy on real shapes
+    python validate_predict.py --scheme mxfp4    # mxfp4 accuracy
+
+The sweep needs torch + a CUDA GPU (mxfp4 also needs vLLM); prediction does not.
+
+## Scope / next
+
+- GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
+  dequant→bf16 (memory win, not compute).
+- Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** grids + predictor.
+- Next: fp16 (same cuBLASLt path), then **flash-attention** and **fusedMoE** — each a
+  new op with its own shape descriptor feeding the same roofline ÷ efficiency split.
