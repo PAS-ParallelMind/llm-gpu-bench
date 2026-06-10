@@ -44,16 +44,20 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 # Shape variables: R requests, H query heads, H_kv KV heads (GQA: H_kv <= H), D head dim,
 # Sq query/chunk length (decode: 1), Sk KV/context length (>= Sq), L = Sk for decode.
 
-# Decode curve: S_q=1 sweep over context L (= S_kv) tracing f_decode(KV bytes). The
-# head config is a vehicle — the curve is in KV bytes, so it is model-agnostic.
+# Decode curve: S_q=1 sweep over (R requests, context L) tracing f_decode(KV bytes). The
+# head config is a vehicle — the curve is in KV bytes, so it is model-agnostic. Sweeping R
+# too extends the KV-byte range to the saturation plateau (a big GPU needs far more in-flight
+# bytes — e.g. B200's 8 TB/s) and, where different R·L land on the same KV bytes, checks the
+# curve really collapses on total bytes (distribution-independent).
 DECODE_L_GRID = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-DECODE_CONFIG = {"H": 32, "H_kv": 8, "D": 128, "R": 8}
+DECODE_R_GRID = [1, 8, 64]
+DECODE_CONFIG = {"H": 32, "H_kv": 8, "D": 128}
 
 # Prefill grid: (S_q <= S_kv) plane x parallelism R*H, per head-dim D (S_q >= 16; S_q=1
 # is the decode curve). H_kv washes out in this compute regime, so a vehicle value is used.
 ATTN_SQ_GRID = [16, 64, 256, 1024, 4096]
 ATTN_SK_GRID = [16, 64, 256, 1024, 4096, 16384]
-ATTN_RH_GRID = [32, 128, 512]
+ATTN_RH_GRID = [32, 64, 128, 256, 512]
 ATTN_D_GRID = [64, 128, 256]
 
 # FlashInfer paged-KV kernel candidates tried per point (best wins; unsupported skipped).
@@ -157,10 +161,12 @@ def _best_call(stage, D, candidates, build, args, dev, iters, warmup):
         try:
             fn, bufs = build(cand, *args)
             ms = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms
-        except Exception as e:                       # unsupported on this GPU / shape
-            _disabled.add((stage, D, cand))
-            _wrappers.pop((stage, cand), None)       # free its workspace
+        except Exception as e:
             torch.cuda.empty_cache()
+            if "out of memory" in str(e).lower():    # shape too big for this candidate here —
+                continue                             #   not unsupported, keep it for other points
+            _disabled.add((stage, D, cand))          # architectural: unsupported on this GPU / D
+            _wrappers.pop((stage, cand), None)       # free its workspace
             print(f"  [skip] {stage} {_name(cand)} D={D}: {str(e).splitlines()[0][:70]}")
             continue
         if best is None or ms < best[0]:
@@ -242,26 +248,34 @@ def measure_mixed_ms(reqs, H, H_kv, D, *, dtype="bf16",
     return t.median_ms
 
 
-def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
+def run_decode_sweep(Ls, Rs, *, b_peak, H=32, H_kv=8, D=128, dtype="bf16",
                      device: int | torch.device = 0, iters=30, warmup=10):
-    """S_q=1 sweep over context L -> the 1-D f_decode(KV bytes) curve (memory-bound)."""
+    """S_q=1 sweep over (R requests, context L) -> the 1-D f_decode(KV bytes) curve
+    (memory-bound). Multiple R extend the range and probe the KV-byte collapse."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
     elem = dt.itemsize
     B = b_peak * 1e9
     recs: list[DecodeRecord] = []
-    pbar = progress(len(Ls), "decode")
-    for L in Ls:
-        ms, cand, fn, bufs = _best_call("dec", D, DECODE_CANDIDATES, _decode_call,
-                                        ([L] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
-        nbytes = kv_bytes(R * L, H_kv, D, elem)
-        sec = ms * 1e-3
-        recs.append(DecodeRecord(kv_tokens=R * L, H_kv=H_kv, D=D, dtype=dtype, median_ms=ms,
-                    backend=_name(cand), efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
-        pbar.set_postfix_str(f"L={L} [{_name(cand)}]")
-        pbar.update(1)
-        del fn, bufs
-        torch.cuda.empty_cache()
+    pbar = progress(len(Rs) * len(Ls), "decode")
+    for R in Rs:
+        for L in Ls:
+            try:
+                ms, cand, fn, bufs = _best_call("dec", D, DECODE_CANDIDATES, _decode_call,
+                                                ([L] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
+            except RuntimeError as e:                 # no backend could run this point (e.g. OOM)
+                print(f"  [skip pt] decode R={R} L={L}: {str(e).splitlines()[0][:50]}")
+                pbar.update(1)
+                torch.cuda.empty_cache()
+                continue
+            nbytes = kv_bytes(R * L, H_kv, D, elem)
+            sec = ms * 1e-3
+            recs.append(DecodeRecord(kv_tokens=R * L, H_kv=H_kv, D=D, dtype=dtype, median_ms=ms,
+                        backend=_name(cand), efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
+            pbar.set_postfix_str(f"R={R} L={L} [{_name(cand)}]")
+            pbar.update(1)
+            del fn, bufs
+            torch.cuda.empty_cache()
     pbar.close()
     return recs
 
@@ -278,8 +292,14 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
     pbar = progress(len(work), f"prefill D={D}")
     for sq, sk, rh in work:
         R = max(rh // H, 1)
-        ms, cand, fn, bufs = _best_call("pre", D, PREFILL_CANDIDATES, _prefill_call,
-                                        ([(sq, sk)] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
+        try:
+            ms, cand, fn, bufs = _best_call("pre", D, PREFILL_CANDIDATES, _prefill_call,
+                                            ([(sq, sk)] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
+        except RuntimeError as e:                     # no backend could run this point (e.g. OOM)
+            print(f"  [skip pt] prefill Sq={sq} Sk={sk} RH={R*H} D={D}: {str(e).splitlines()[0][:50]}")
+            pbar.update(1)
+            torch.cuda.empty_cache()
+            continue
         tc = attn_flops(R, sq, sk, H, D) / C
         tm = attn_bytes(R, sq, sk, H, H_kv, D, elem) / B
         sec = ms * 1e-3
@@ -296,8 +316,8 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
 
 def run_full_attn_sweep(*, c_peak, b_peak, dtype="bf16", device=0, iters=30, warmup=10):
     """Hybrid sweep: the decode KV-byte curve + the prefill grid over all head dims D."""
-    decode = run_decode_sweep(DECODE_L_GRID, b_peak=b_peak, dtype=dtype, device=device,
-                              iters=iters, warmup=warmup, **DECODE_CONFIG)
+    decode = run_decode_sweep(DECODE_L_GRID, DECODE_R_GRID, b_peak=b_peak, dtype=dtype,
+                              device=device, iters=iters, warmup=warmup, **DECODE_CONFIG)
     grid: list[AttnRecord] = []
     for D in ATTN_D_GRID:
         grid += run_attn_sweep(ATTN_SQ_GRID, ATTN_SK_GRID, ATTN_RH_GRID, D=D,

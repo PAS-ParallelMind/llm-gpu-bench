@@ -132,7 +132,9 @@ mixed batch matches a uniform one with the same total KV bytes). One **1-D curve
 
     t = (KV_bytes / B_peak) / f(KV_bytes),   KV_bytes = 2·elem·Σ_i ⌈L_i/16⌉·16·H_kv·D
 
-The curve runs **0.08 (1 MB KV) → 0.92 (2 GB KV)** — paged-KV reads saturate HBM more
+The curve is swept over (R requests, context L) so it spans KV bytes up to the saturation
+plateau — **0.01 (small) → 0.95 (multi-GB KV)** — and the overlapping R·L points double as a
+check that efficiency really collapses on total KV bytes. Paged-KV reads saturate HBM more
 slowly than GEMM's contiguous weight read, so it's its own curve.
 
 **Prefill / chunked (`S_q > 1`)** — a batched causal GEMM (per-head QKᵀ then PV) over
@@ -152,7 +154,7 @@ its KV-byte curve and prefill keeps its (S_q, S_kv, R·H, D) grid.
 Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × 8 cases spanning
 decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`:
 
-    latency error:  median 3.9%   mean 8.7%   p90 21%   (roofline-only baseline: median 20%)
+    latency error:  median 2.6%   mean 6.0%   p90 12%   (roofline-only baseline: median 20%)
 
 - **Decode** lands ~0–11% (mixed-batch decode ~0%); model-agnostic across head config.
 - **Single-request transition** is the floor: full prefill at S_q=S_kv≈512 (R=1) hits
