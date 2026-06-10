@@ -1,12 +1,20 @@
-"""Flash-attention sweep — a hybrid model over the sequence plane (vLLM, paged KV).
+"""Flash-attention sweep — a hybrid model over the sequence plane (FlashInfer, paged KV).
 
-vLLM runs decode + prefill through one unified flash_attn_varlen_func (paged KV, varlen
-cu_seqlens), so the op spans the whole (S_q, S_kv) plane. But the efficiency has two
-physics regimes that want *different* scale variables, so we model them separately:
+vLLM's targeted attention library is FlashInfer, which dispatches a paged-KV call to one of
+several underlying kernels. Which ones exist depends on the GPU: prefill can be fa2 (the
+Ampere+ baseline), fa3 (Hopper SM90), cutlass, or trtllm-gen (Hopper/Blackwell); decode is
+fa2 (CUDA-core or tensor-core) or trtllm-gen. So for each sweep point we try every candidate,
+skip the ones that don't support this GPU/shape, and keep the FASTEST — the efficiency factor
+is then the *best achievable* across FlashInfer's kernels, and we record which backend won.
+(On Ada / RTX 4090 only fa2 runs; on Hopper/Blackwell the faster kernels are picked up.)
 
-  * DECODE (S_q = 1): always memory-bound; split-KV provides the parallelism. Efficiency
-    collapses to a 1-D curve in total (block-padded) KV bytes — model-agnostic across
-    head config, request count, and batch composition. (Validated ~2%.)
+The op spans the whole (S_q, S_kv) plane, but the efficiency has two physics regimes that
+want *different* scale variables, so we model them separately (one `attn_latency_ms` routes
+on S_q):
+
+  * DECODE (S_q = 1): always memory-bound; the decode wrapper's split-KV provides the
+    parallelism. Efficiency collapses to a 1-D curve in total (block-padded) KV bytes —
+    model-agnostic across head config, request count, and batch composition.
         KV_bytes = 2·elem·Σ_i ceil(L_i/block)·block · H_kv·D
         t = (KV_bytes / B_peak) / f_decode(KV_bytes)
 
@@ -17,25 +25,24 @@ physics regimes that want *different* scale variables, so we model them separate
         t = max(FLOPs/C_peak, bytes/B_peak) / f_prefill(S_q, S_kv, R·H, D)
 
 Why hybrid: decode scales with R·S_kv·H_kv·D (KV bytes), prefill with R·H (parallelism) —
-different functions of R and H, so they don't share one grid's axes (measured). The
-kernel is vLLM's flash_attn_varlen_func + paged KV (checked vs a bottom-right-causal ref);
-we add the timing harness and roofline.
+different functions of R and H, so they don't share one grid's axes (measured). vLLM splits
+a continuous-batching step into a BatchDecode + a BatchPrefill wrapper, so this hybrid is
+exactly how a real step decomposes, and mixed steps compose additively (t_prefill + t_decode).
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
+import flashinfer
 import torch
 
 from timing import measure, progress
-from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-BLOCK_SIZE = 16   # vLLM's default paged-KV block size
+BLOCK_SIZE = 16   # paged-KV page size (vLLM's default block size)
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 # Shape variables: R requests, H query heads, H_kv KV heads (GQA: H_kv <= H), D head dim,
-# Sq query/chunk length (decode: 1), Sk KV/context length (>= Sq).
+# Sq query/chunk length (decode: 1), Sk KV/context length (>= Sq), L = Sk for decode.
 
 # Decode curve: S_q=1 sweep over context L (= S_kv) tracing f_decode(KV bytes). The
 # head config is a vehicle — the curve is in KV bytes, so it is model-agnostic.
@@ -48,6 +55,15 @@ ATTN_SQ_GRID = [16, 64, 256, 1024, 4096]
 ATTN_SK_GRID = [16, 64, 256, 1024, 4096, 16384]
 ATTN_RH_GRID = [32, 128, 512]
 ATTN_D_GRID = [64, 128, 256]
+
+# FlashInfer kernel candidates tried per point (best wins; unsupported ones are skipped).
+# Decode: (backend, use_tensor_cores).  Prefill: backend name.
+DECODE_CANDIDATES = [("fa2", False), ("fa2", True), ("trtllm-gen", False)]
+PREFILL_CANDIDATES = ["fa2", "fa3", "cutlass", "trtllm-gen"]
+
+
+def _name(cand) -> str:
+    return f"{cand[0]}{'+tc' if cand[1] else ''}" if isinstance(cand, tuple) else cand
 
 
 def kv_bytes(kv_tokens: int, H_kv: int, D: int, elem: int = 2) -> float:
@@ -69,70 +85,84 @@ def attn_bytes(R: int, Sq: int, Sk: int, H: int, H_kv: int, D: int, elem: int = 
     return 2 * elem * R * (Sq * H * D + Sk * H_kv * D)   # Q,O over S_q + K,V over S_kv
 
 
-def _attn_call(R, Sq, Sk, H, H_kv, D, dt, dev):
-    nblk = (Sk + BLOCK_SIZE - 1) // BLOCK_SIZE
-    nb = R * nblk
-    q = torch.randn(R * Sq, H, D, device=dev, dtype=dt)
-    kc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
-    vc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
-    bt = torch.arange(nb, device=dev, dtype=torch.int32).view(R, nblk)
-    cu = torch.arange(0, (R + 1) * Sq, Sq, device=dev, dtype=torch.int32)
-    su = torch.full((R,), Sk, device=dev, dtype=torch.int32)
-    fn = lambda: flash_attn_varlen_func(
-        q=q, k=kc, v=vc, max_seqlen_q=Sq, cu_seqlens_q=cu, max_seqlen_k=Sk,
-        seqused_k=su, softmax_scale=1.0 / math.sqrt(D), causal=True, block_table=bt)
-    return fn, (q, kc, vc)
+# --- FlashInfer paged-KV wrappers (one per candidate; lazily built, re-planned per point) --
+_WS_BYTES = 256 * 1024 * 1024
+_wrappers: dict = {}
+_disabled: set = set()   # (stage, D, cand) that failed -> not retried at this head-dim
 
 
-def measure_attn_ms(R, Sq, Sk, H, H_kv, D, *, dtype="bf16",
-                    device: int | torch.device = 0, iters=30, warmup=10,
-                    call=_attn_call) -> float:
-    """Median ms for one attention call (decode S_q=1 or prefill S_q>1). `call` is the
-    kernel builder (FlashAttention here; attn_flashinfer supplies the FlashInfer one)."""
-    dev = torch.device("cuda", device) if isinstance(device, int) else device
-    fn, bufs = call(R, Sq, Sk, H, H_kv, D, _DTYPES[dtype], dev)
-    t = measure(fn, device=dev, iters=iters, warmup=warmup)
-    del fn, bufs
-    torch.cuda.empty_cache()
-    return t.median_ms
+def _wrapper(stage, cand, dev):
+    key = (stage, cand)
+    w = _wrappers.get(key)
+    if w is None:
+        ws = torch.empty(_WS_BYTES, dtype=torch.uint8, device=dev)
+        if stage == "dec":
+            be, tc = cand
+            w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", use_tensor_cores=tc, backend=be)
+        else:
+            w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend=cand)
+        _wrappers[key] = w
+    return w
 
 
-def _mixed_attn_call(reqs, H, H_kv, D, dt, dev):
-    """One fused varlen flash-attn call over heterogeneous requests — what a vLLM
-    continuous-batching step actually launches. `reqs`: list of (S_q_i, S_kv_i);
-    decode requests have S_q_i = 1, prefill S_q_i > 1. Query rows are varlen-packed
-    (Σ S_q_i) and each request keeps its own paged-KV block range."""
+def _paged(sks, H_kv, D, dt, dev):
+    """Paged KV cache (NHD) + index arrays for requests with contexts `sks`; contiguous pages."""
+    pages = [(s + BLOCK_SIZE - 1) // BLOCK_SIZE for s in sks]
+    tot = sum(pages)
+    indptr = torch.zeros(len(sks) + 1, device=dev, dtype=torch.int32)
+    indptr[1:] = torch.tensor(pages, device=dev, dtype=torch.int32).cumsum(0)
+    indices = torch.arange(tot, device=dev, dtype=torch.int32)
+    last = torch.tensor([((s - 1) % BLOCK_SIZE) + 1 for s in sks], device=dev, dtype=torch.int32)
+    kc = torch.randn(tot, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
+    vc = torch.randn(tot, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
+    return indptr, indices, last, (kc, vc)
+
+
+def _decode_call(cand, sks, H, H_kv, D, dt, dev):
+    w = _wrapper("dec", cand, dev)
+    indptr, indices, last, kv = _paged(sks, H_kv, D, dt, dev)
+    w.plan(indptr, indices, last, H, H_kv, D, BLOCK_SIZE, q_data_type=dt, kv_data_type=dt)
+    q = torch.randn(len(sks), H, D, device=dev, dtype=dt)
+    return (lambda: w.run(q, kv)), (q, kv)
+
+
+def _prefill_call(cand, reqs, H, H_kv, D, dt, dev):
+    w = _wrapper("pre", cand, dev)
     sqs = [sq for sq, _ in reqs]
-    sks = [sk for _, sk in reqs]
-    nblks = [(sk + BLOCK_SIZE - 1) // BLOCK_SIZE for sk in sks]
-    nb = sum(nblks)
+    indptr, indices, last, kv = _paged([sk for _, sk in reqs], H_kv, D, dt, dev)
+    qo = torch.zeros(len(reqs) + 1, device=dev, dtype=torch.int32)
+    qo[1:] = torch.tensor(sqs, device=dev, dtype=torch.int32).cumsum(0)
+    w.plan(qo, indptr, indices, last, H, H_kv, D, BLOCK_SIZE, causal=True,
+           q_data_type=dt, kv_data_type=dt)
     q = torch.randn(sum(sqs), H, D, device=dev, dtype=dt)
-    kc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
-    vc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
-    bt = torch.zeros(len(reqs), max(nblks), dtype=torch.int32)   # (R, max_blocks)
-    off = 0
-    for i, n in enumerate(nblks):
-        bt[i, :n] = torch.arange(off, off + n, dtype=torch.int32)
-        off += n
-    cu = torch.zeros(len(reqs) + 1, dtype=torch.int32)
-    cu[1:] = torch.tensor(sqs, dtype=torch.int32).cumsum(0)
-    su = torch.tensor(sks, device=dev, dtype=torch.int32)
-    bt, cu = bt.to(dev), cu.to(dev)
-    fn = lambda: flash_attn_varlen_func(
-        q=q, k=kc, v=vc, max_seqlen_q=max(sqs), cu_seqlens_q=cu, max_seqlen_k=max(sks),
-        seqused_k=su, softmax_scale=1.0 / math.sqrt(D), causal=True, block_table=bt)
-    return fn, (q, kc, vc)
+    return (lambda: w.run(q, kv)), (q, kv)
 
 
-def measure_mixed_ms(reqs, H, H_kv, D, *, dtype="bf16",
-                     device: int | torch.device = 0, iters=30, warmup=10) -> float:
-    """Median ms for one fused call mixing prefill (S_q>1) and decode (S_q=1) requests."""
-    dev = torch.device("cuda", device) if isinstance(device, int) else device
-    fn, bufs = _mixed_attn_call(reqs, H, H_kv, D, _DTYPES[dtype], dev)
-    t = measure(fn, device=dev, iters=iters, warmup=warmup)
-    del fn, bufs
-    torch.cuda.empty_cache()
-    return t.median_ms
+def _best_call(stage, D, candidates, build, args, dev, iters, warmup):
+    """Try each candidate kernel for one point, skipping unsupported ones; return the
+    fastest as (median_ms, cand, fn, bufs) with the winner's call still live."""
+    best = None
+    for cand in candidates:
+        if (stage, D, cand) in _disabled:
+            continue
+        try:
+            fn, bufs = build(cand, *args)
+            ms = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms
+        except Exception as e:                       # unsupported on this GPU / shape
+            _disabled.add((stage, D, cand))
+            _wrappers.pop((stage, cand), None)       # free its workspace
+            torch.cuda.empty_cache()
+            print(f"  [skip] {stage} {_name(cand)} D={D}: {str(e).splitlines()[0][:70]}")
+            continue
+        if best is None or ms < best[0]:
+            prev, best = best, (ms, cand, fn, bufs)
+            del prev                                 # drop previous winner's fn/bufs for GC
+        else:
+            del fn, bufs
+        torch.cuda.empty_cache()
+    if best is None:
+        raise RuntimeError(f"no FlashInfer {stage} backend supports D={D}, args={args[0]}")
+    return best
 
 
 @dataclass
@@ -142,6 +172,7 @@ class DecodeRecord:
     D: int
     dtype: str
     median_ms: float
+    backend: str            # winning FlashInfer kernel
     efficiency: float = 0.0
 
 
@@ -154,11 +185,56 @@ class AttnRecord:
     dtype: str
     median_ms: float
     regime: str             # "C" compute-bound, "M" memory-bound
+    backend: str            # winning FlashInfer kernel
     efficiency: float = 0.0
 
 
+def measure_attn_ms(R, Sq, Sk, H, H_kv, D, *, dtype="bf16",
+                    device: int | torch.device = 0, iters=30, warmup=10) -> float:
+    """Best-of-backends median ms for one homogeneous call (decode S_q=1 or prefill S_q>1)."""
+    dev = torch.device("cuda", device) if isinstance(device, int) else device
+    dt = _DTYPES[dtype]
+    if Sq == 1:
+        ms, _, fn, bufs = _best_call("dec", D, DECODE_CANDIDATES, _decode_call,
+                                     ([Sk] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
+    else:
+        ms, _, fn, bufs = _best_call("pre", D, PREFILL_CANDIDATES, _prefill_call,
+                                     ([(Sq, Sk)] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
+    del fn, bufs
+    torch.cuda.empty_cache()
+    return ms
+
+
+def measure_mixed_ms(reqs, H, H_kv, D, *, dtype="bf16",
+                     device: int | torch.device = 0, iters=30, warmup=10) -> float:
+    """vLLM's FlashInfer mixed step: best prefill kernel + best decode kernel, back-to-back
+    on one stream (separate kernels — so latency is additive, decode keeps its split-KV)."""
+    dev = torch.device("cuda", device) if isinstance(device, int) else device
+    dt = _DTYPES[dtype]
+    pre_reqs = [(sq, sk) for sq, sk in reqs if sq > 1]
+    dec_sks = [sk for sq, sk in reqs if sq == 1]
+    fns, keep = [], []
+    if pre_reqs:
+        _, _, fn, bufs = _best_call("pre", D, PREFILL_CANDIDATES, _prefill_call,
+                                    (pre_reqs, H, H_kv, D, dt, dev), dev, iters, warmup)
+        fns.append(fn); keep += [fn, bufs]
+    if dec_sks:
+        _, _, fn, bufs = _best_call("dec", D, DECODE_CANDIDATES, _decode_call,
+                                    (dec_sks, H, H_kv, D, dt, dev), dev, iters, warmup)
+        fns.append(fn); keep += [fn, bufs]
+
+    def step():
+        for f in fns:
+            f()
+
+    t = measure(step, device=dev, iters=iters, warmup=warmup)
+    del fns, keep
+    torch.cuda.empty_cache()
+    return t.median_ms
+
+
 def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
-                     device: int | torch.device = 0, iters=30, warmup=10, call=_attn_call):
+                     device: int | torch.device = 0, iters=30, warmup=10):
     """S_q=1 sweep over context L -> the 1-D f_decode(KV bytes) curve (memory-bound)."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
@@ -167,13 +243,13 @@ def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
     recs: list[DecodeRecord] = []
     pbar = progress(len(Ls), "decode")
     for L in Ls:
-        fn, bufs = call(R, 1, L, H, H_kv, D, dt, dev)
-        t = measure(fn, device=dev, iters=iters, warmup=warmup)
+        ms, cand, fn, bufs = _best_call("dec", D, DECODE_CANDIDATES, _decode_call,
+                                        ([L] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
         nbytes = kv_bytes(R * L, H_kv, D, elem)
-        sec = t.median_ms * 1e-3
-        recs.append(DecodeRecord(kv_tokens=R * L, H_kv=H_kv, D=D, dtype=dtype,
-                    median_ms=t.median_ms, efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
-        pbar.set_postfix_str(f"L={L}")
+        sec = ms * 1e-3
+        recs.append(DecodeRecord(kv_tokens=R * L, H_kv=H_kv, D=D, dtype=dtype, median_ms=ms,
+                    backend=_name(cand), efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
+        pbar.set_postfix_str(f"L={L} [{_name(cand)}]")
         pbar.update(1)
         del fn, bufs
         torch.cuda.empty_cache()
@@ -182,7 +258,7 @@ def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
 
 
 def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf16",
-                   device: int | torch.device = 0, iters=30, warmup=10, call=_attn_call):
+                   device: int | torch.device = 0, iters=30, warmup=10):
     """Prefill grid: the (S_q <= S_kv) plane x R*H for one head-dim D (S_q > 1)."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
@@ -193,15 +269,15 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
     pbar = progress(len(work), f"prefill D={D}")
     for sq, sk, rh in work:
         R = max(rh // H, 1)
-        fn, bufs = call(R, sq, sk, H, H_kv, D, dt, dev)
-        t = measure(fn, device=dev, iters=iters, warmup=warmup)
+        ms, cand, fn, bufs = _best_call("pre", D, PREFILL_CANDIDATES, _prefill_call,
+                                        ([(sq, sk)] * R, H, H_kv, D, dt, dev), dev, iters, warmup)
         tc = attn_flops(R, sq, sk, H, D) / C
         tm = attn_bytes(R, sq, sk, H, H_kv, D, elem) / B
-        sec = t.median_ms * 1e-3
-        recs.append(AttnRecord(Sq=sq, Sk=sk, RH=R * H, D=D, dtype=dtype, median_ms=t.median_ms,
-                    regime="C" if tc > tm else "M",
+        sec = ms * 1e-3
+        recs.append(AttnRecord(Sq=sq, Sk=sk, RH=R * H, D=D, dtype=dtype, median_ms=ms,
+                    regime="C" if tc > tm else "M", backend=_name(cand),
                     efficiency=(max(tc, tm) / sec) if sec > 0 else 0.0))
-        pbar.set_postfix_str(f"Sq={sq} Sk={sk} RH={R*H}")
+        pbar.set_postfix_str(f"Sq={sq} Sk={sk} RH={R*H} [{_name(cand)}]")
         pbar.update(1)
         del fn, bufs
         torch.cuda.empty_cache()
@@ -209,14 +285,13 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
     return recs
 
 
-def run_full_attn_sweep(*, c_peak, b_peak, dtype="bf16", device=0, iters=30, warmup=10,
-                        call=_attn_call):
+def run_full_attn_sweep(*, c_peak, b_peak, dtype="bf16", device=0, iters=30, warmup=10):
     """Hybrid sweep: the decode KV-byte curve + the prefill grid over all head dims D."""
     decode = run_decode_sweep(DECODE_L_GRID, b_peak=b_peak, dtype=dtype, device=device,
-                              iters=iters, warmup=warmup, call=call, **DECODE_CONFIG)
+                              iters=iters, warmup=warmup, **DECODE_CONFIG)
     grid: list[AttnRecord] = []
     for D in ATTN_D_GRID:
         grid += run_attn_sweep(ATTN_SQ_GRID, ATTN_SK_GRID, ATTN_RH_GRID, D=D,
                                c_peak=c_peak, b_peak=b_peak, dtype=dtype, device=device,
-                               iters=iters, warmup=warmup, call=call)
+                               iters=iters, warmup=warmup)
     return decode, grid

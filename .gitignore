@@ -9,3 +9,6 @@ vllm_env/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
+
+# local agent artifacts
+.claude/

@@ -50,7 +50,7 @@ class Predictor:
     attn_eff: dict = field(default_factory=dict)                 # {(Sq,Sk,RH,D): eff} (prefill grid)
     attn_axes: tuple = field(default_factory=tuple)              # (Sqs, Sks, RHs, Ds)
     attn_decode_curve: list = field(default_factory=list)        # sorted [(log KV_bytes, eff)]
-    attn_backend: str = "flash_attn"                             # which kernel the grid was measured on
+    attn_backend: str = "flashinfer"                             # library the grid was measured on
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
@@ -64,7 +64,7 @@ class Predictor:
             gaxes = tuple(sorted({k[i] for k in geff}) for i in range(4))
             return cls(b_peak=b_peak, op="attn", attn_c=float(d["c_peak_tflops"]),
                        attn_eff=geff, attn_axes=gaxes, attn_decode_curve=dcurve,
-                       attn_backend=d.get("backend", "flash_attn"))
+                       attn_backend=d.get("backend", "flashinfer"))
         c_peak = {k: float(v) for k, v in d["c_peak"].items()}
         # bf16/fp16 read & write 2 bytes/elem; quant schemes override via the JSON.
         bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0})

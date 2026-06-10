@@ -113,17 +113,9 @@ def validate_gemm(args, dtype: str) -> None:
     _summary(pred_all, roof_all)
 
 
-def _attn_module(backend: str):
-    if backend == "flashinfer":
-        import attn_flashinfer as m
-    else:
-        import attn as m
-    return m
-
-
 def validate_attn(args) -> None:
-    attn = _attn_module(args.attn_backend)
-    path = args.results or str(sorted(Path("results").glob(f"attn_{args.attn_backend}_*.json"))[-1])
+    import attn
+    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   attention   {len(ATTN_CONFIGS)} head configs x "
@@ -143,9 +135,9 @@ def validate_attn(args) -> None:
 
 
 def validate_mixed(args) -> None:
-    """Mixed prefill+decode steps: is the fused-kernel time max(parts) or sum(parts)?"""
-    attn = _attn_module(args.attn_backend)
-    path = args.results or str(sorted(Path("results").glob(f"attn_{args.attn_backend}_*.json"))[-1])
+    """Mixed prefill+decode steps: does the step compose as t_prefill + t_decode?"""
+    import attn
+    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   mixed continuous-batching steps   "
@@ -177,8 +169,6 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
                     choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed"])
-    ap.add_argument("--attn-backend", default="flash_attn",
-                    choices=["flash_attn", "flashinfer"], help="attention backend (attn only)")
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--iters", type=int, default=50)

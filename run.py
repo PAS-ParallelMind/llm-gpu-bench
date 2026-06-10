@@ -7,8 +7,9 @@
 
 --bench is <op>_<dtype>: gemm_bf16 / gemm_fp16 go through torch's F.linear (cuBLAS /
 cuBLASLt / CUTLASS per shape); gemm_mxfp4 goes through the vLLM Marlin w4a16 kernel;
-attn_bf16 sweeps flash-attention (vLLM FlashAttention, paged KV) — a decode KV-byte
-curve plus a prefill (S_q, S_kv, R·H) × D grid. Each writes its own results file.
+attn_bf16 sweeps flash-attention (FlashInfer, paged KV; best of its fa2/fa3/cutlass/
+trtllm-gen kernels per shape) — a decode KV-byte curve plus a prefill (S_q, S_kv, R·H)
+× D grid. Each writes its own results file.
 
 GEMM and prefill attention need the theoretical roofline ceiling via --c-peak (TFLOP/s)
 and --b-peak (GB/s); decode attention is always memory-bound, so --b-peak carries it. The
@@ -27,33 +28,29 @@ import torch
 from gemm import DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
-def _attn_module(backend: str):
-    """Select the attention backend implementation (same hybrid API, different kernels)."""
-    if backend == "flashinfer":
-        import attn_flashinfer as m
-    else:
-        import attn as m
-    return m
-
-
 def _run_attn(args, props, dtype: str) -> None:
-    """Flash-attention: decode KV-byte curve + prefill (S_q, S_kv, R*H) x D grid."""
-    import vllm
-    mod = _attn_module(args.attn_backend)
-    label = {"flash_attn": "FlashAttention", "flashinfer": "FlashInfer"}[args.attn_backend]
-    print(f"\n== attn ({label}, paged KV) ==")
-    decode, grid = mod.run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
-                                           device=args.device, iters=args.iters, warmup=args.warmup)
+    """Flash-attention (FlashInfer, best of kernels): decode KV-byte curve + prefill grid."""
+    import flashinfer
+    from attn import DECODE_CANDIDATES, PREFILL_CANDIDATES, run_full_attn_sweep
+    print("\n== attn (FlashInfer, paged KV, best of backends) ==")
+    decode, grid = run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
+                                       device=args.device, iters=args.iters, warmup=args.warmup)
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
     print(f"  decode curve {len(decode)} pts ({decode[0].efficiency:.2f}..{decode[-1].efficiency:.2f})"
           f"   prefill grid {len(grid)} pts")
-    out = Path(args.out or f"results/attn_{args.attn_backend}_{props.name.replace(' ', '_')}.json")
+    won = {}
+    for r in decode + grid:
+        won[r.backend] = won.get(r.backend, 0) + 1
+    print(f"  winning kernels: " + ", ".join(f"{k}×{v}" for k, v in sorted(won.items())))
+    out = Path(args.out or f"results/attn_{props.name.replace(' ', '_')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "gpu": props.name,
-        "lib": {"vllm": vllm.__version__},
+        "lib": {"flashinfer": flashinfer.__version__},
         "op": "attn",
-        "backend": args.attn_backend,
+        "backend": "flashinfer",
+        "candidates": {"decode": [str(c) for c in DECODE_CANDIDATES],
+                       "prefill": PREFILL_CANDIDATES},
         "c_peak_tflops": args.c_peak,
         "b_peak_gbps": args.b_peak,
         "decode": [asdict(r) for r in decode],
@@ -67,9 +64,6 @@ def main() -> None:
     ap.add_argument("--bench", default="gemm_bf16",
                     choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16"],
                     help="which benchmark to run (<op>_<dtype>).")
-    ap.add_argument("--attn-backend", default="flash_attn",
-                    choices=["flash_attn", "flashinfer"],
-                    help="attention backend (attn only): vLLM FA varlen or FlashInfer wrappers.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,
                     help="Subset of SHAPES keys (gemm only; default: all).")
