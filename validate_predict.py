@@ -36,14 +36,22 @@ MODEL_SHAPES: dict[str, tuple[int, int]] = {
 }
 VAL_MS = [1, 4, 16, 64, 256, 1024, 4096]
 
-# Decode attention: real head configs (H, H_kv, D) × a (batch R, context L) grid.
+# Attention: real head configs (H, H_kv, D) × cases covering decode / full prefill /
+# chunked prefill. S_q, S_kv are mostly off-grid to exercise interpolation.
 ATTN_CONFIGS: dict[str, tuple[int, int, int]] = {
     "gptoss": (64, 8, 64),
     "qwen":   (32, 4, 128),
 }
-ATTN_RS = [1, 8, 32, 128]
-ATTN_LS = [1024, 4096, 16384, 65536]
-_KV_TOKEN_CAP = 4_000_000   # skip (R·L) above this to keep the KV cache in memory
+ATTN_CASES = [   # (kind, R, S_q, S_kv)
+    ("decode",   1,    1,  2048),
+    ("decode",  32,    1,  8192),
+    ("prefill",  1,  512,   512),
+    ("prefill",  2, 2048,  2048),
+    ("prefill",  1, 8192,  8192),
+    ("chunked",  1,  512,  4096),
+    ("chunked",  4, 2048,  8192),
+    ("chunked",  1,  256, 16384),
+]
 
 
 def _summary(pred_all, roof_all) -> None:
@@ -92,30 +100,22 @@ def validate_gemm(args, dtype: str) -> None:
 
 def validate_attn(args) -> None:
     import attn
-    path = args.results or str(sorted(Path("results").glob("attn_decode_*.json"))[-1])
+    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
     pred = Predictor.from_json(path)
 
-    print(f"curve: {path}   decode attention   {len(ATTN_CONFIGS)} head configs"
-          f" x (R, L)\n")
-    print(f"  {'config':8} {'R':>4} | " + " ".join(f"L={l:<6}" for l in ATTN_LS)
-          + "  | pred  roof")
+    print(f"grid: {path}   attention   {len(ATTN_CONFIGS)} head configs x "
+          f"{len(ATTN_CASES)} cases (decode / prefill / chunked)\n")
+    print(f"  {'config':8} {'kind':8} {'R':>3} {'S_q':>5} {'S_kv':>6} | {'pred':>5} {'roof':>5}")
     pred_all, roof_all = [], []
     for name, (H, H_kv, D) in ATTN_CONFIGS.items():
-        for R in ATTN_RS:
-            cells, pe, re = [], [], []
-            for L in ATTN_LS:
-                if R * L > _KV_TOKEN_CAP:
-                    cells.append("   -  "); continue
-                meas = attn.measure_decode_ms(R, L, H, H_kv, D, device=args.device,
-                                              iters=args.iters, warmup=args.warmup)
-                kv = attn.padded_kv_tokens([L] * R)     # block-padded KV tokens read
-                ep = abs(pred.decode_latency_ms(kv, H_kv, D) - meas) / meas
-                er = abs(pred.decode_roofline_ms(kv, H_kv, D) - meas) / meas
-                cells.append(f"{ep*100:5.0f}%")
-                pe.append(ep); re.append(er); pred_all.append(ep); roof_all.append(er)
-            tail = f"{np.mean(pe)*100:4.0f}%  {np.mean(re)*100:4.0f}%" if pe else "n/a"
-            print(f"  {name:8} {R:>4} | " + " ".join(f"{c:>8}" for c in cells)
-                  + f"  | {tail}")
+        for kind, R, Sq, Sk in ATTN_CASES:
+            meas = attn.measure_attn_ms(R, Sq, Sk, H, H_kv, D, device=args.device,
+                                        iters=args.iters, warmup=args.warmup)
+            ep = abs(pred.attn_latency_ms(R, Sq, Sk, H, H_kv, D) - meas) / meas
+            er = abs(pred.attn_roofline_ms(R, Sq, Sk, H, H_kv, D) - meas) / meas
+            pred_all.append(ep); roof_all.append(er)
+            print(f"  {name:8} {kind:8} {R:>3} {Sq:>5} {Sk:>6} | "
+                  f"{ep*100:>4.0f}% {er*100:>4.0f}%")
     _summary(pred_all, roof_all)
 
 

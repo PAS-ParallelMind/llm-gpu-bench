@@ -107,44 +107,64 @@ Accuracy on the 9 runnable real projections (`validate_predict.py --bench gemm_m
   grid is unaffected; production pads such weights to marlin-friendly dims, and the
   sweep skips unrunnable shapes rather than crash.
 
-## decode attention (vLLM FlashAttention, paged KV)
+## attention (vLLM FlashAttention, paged KV) — hybrid
 
-A third op, and the simplest. Decode attention (1 query token per request, reading
-the whole KV cache) is *always* memory-bound — arithmetic intensity = 2·(H/H_kv)/elem
-(the GQA ratio), far below the ridge. Measurement shows efficiency depends only on
-the **total KV bytes** streamed — not on head config (H, H_kv, D), request count, or
-how the bytes split across requests' context lengths (a skewed mixed batch matches a
-uniform one with the same total KV bytes). So a single **1-D curve `eff = f(KV bytes)`**
-predicts decode attention for any model and any continuous batch:
+A third op. vLLM runs decode + prefill through *one* unified `flash_attn_varlen_func`
+(paged KV + varlen `cu_seqlens`), so the op spans the whole `(S_q, S_kv)` plane. But the
+**efficiency has two physics regimes that want different scale variables**, so we model
+them separately and route on `S_q` inside one `attn_latency_ms`:
+
+**Decode (`S_q = 1`)** — 1 query token per request reading the whole KV cache, *always*
+memory-bound (arithmetic intensity = 2·(H/H_kv)/elem, the GQA ratio, far below the ridge).
+Efficiency depends only on the **total KV bytes** streamed — not on head config
+(H, H_kv, D), request count, or how the bytes split across requests' contexts (a skewed
+mixed batch matches a uniform one with the same total KV bytes). One **1-D curve
+`eff = f(KV bytes)`** predicts decode for any model and any continuous batch:
 
     t = (KV_bytes / B_peak) / f(KV_bytes),   KV_bytes = 2·elem·Σ_i ⌈L_i/16⌉·16·H_kv·D
 
-vLLM's FlashAttention backend runs prefill+decode through one unified
-`flash_attn_varlen_func` (paged KV + cu_seqlens), so decode is the S_q=1 slice. The
-curve runs **0.03 (1 MB KV) → 0.92 (2 GB KV)** — paged-KV reads saturate HBM more
+The curve runs **0.03 (1 MB KV) → 0.92 (2 GB KV)** — paged-KV reads saturate HBM more
 slowly than GEMM's contiguous weight read, so it's its own curve.
 
-Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × (batch, context),
-`validate_predict.py --bench attn_bf16`:
+**Prefill / chunked (`S_q > 1`)** — a batched causal GEMM (per-head QKᵀ then PV) over
+R·H heads. Efficiency is a **3-D surface over (S_q, S_kv, R·H) per head-dim D** (H_kv
+washes out in this compute regime; R·H is the parallelism axis and collapses on the
+product). The roofline is the causal trapezoid:
 
-    latency error:  median 1.7%   mean 3.7%   (roofline-only baseline: median 31%)
+    FLOPs = 4·H·D·R·(S_q·S_kv − S_q(S_q−1)/2);  bytes = 2·elem·R·(S_q·H·D + S_kv·H_kv·D)
+    t = max(FLOPs/C_peak, bytes/B_peak) / f(S_q, S_kv, R·H, D)
 
-- **Verified range.** Stress-tested across head config, paged block size, request
+**Why hybrid, not one grid.** Decode efficiency scales with `R·S_kv·H_kv·D` (KV bytes);
+prefill with `R·H` (parallelism) — *different* functions of R and H. A single shared
+grid was tried and forced to drop one or the other: it pulled gpt-oss decode (H=64) to
+~30% error because decode doesn't scale with R·H. Measured, not assumed — so decode keeps
+its KV-byte curve and prefill keeps its (S_q, S_kv, R·H, D) grid.
+
+Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × 8 cases spanning
+decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`:
+
+    latency error:  median 3.0%   mean 6.7%   p90 20%   (roofline-only baseline: median 21%)
+
+- **Decode** lands ~0–11% (mixed-batch decode ~0%); model-agnostic across head config.
+- **Single-request transition** is the floor: full prefill at S_q=S_kv≈512 (R=1) hits
+  ~30% — the compute-ramp where the kernel crosses from memory- to compute-bound, steep
+  between octave grid points, analogous to GEMM's transition sag. Batched and longer cases
+  sit at 1–7%.
+- **Decode verified range.** Stress-tested across head config, paged block size, request
   count, and batch composition — the 1-D collapse holds for per-request context
-  **L_i ≳ 128 tokens** (covers realistic decode). In the large-batch × very-short-context
-  corner (many requests each < ~128 tokens), per-request overhead pulls efficiency below
-  the curve, so it over-predicts there; documented, not modeled.
+  **L_i ≳ 128 tokens**. In the large-batch × very-short-context corner (many requests each
+  < ~128 tokens), per-request overhead pulls efficiency below the curve; documented, not modeled.
 
 ## Files
 
     timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
     gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
     marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
-    attn.py               decode flash-attn sweep + KV-byte curve        (torch+vLLM)
+    attn.py               flash-attn sweep: decode KV-byte curve + prefill grid (torch+vLLM)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
-    predict.py            latency predictor (gemm trilinear / attn curve) (stdlib)
+    predict.py            latency predictor (gemm trilinear / attn hybrid) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
-    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_decode_<gpu>.json
+    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<gpu>.json
 
 ## Run
 
@@ -152,20 +172,21 @@ Activate the env (torch + CUDA), then:
 
     python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
     python run.py --bench gemm_mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 (Marlin)
-    python run.py --bench attn_bf16               --b-peak 1008   # decode flash-attn curve
+    python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008   # flash-attn (decode + prefill)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
-    python predict.py --results results/attn_decode_*.json --head 4 128 --kv 131072  # attn
+    python predict.py --results results/attn_*.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
     python validate_predict.py --bench gemm_bf16                  # gemm accuracy
-    python validate_predict.py --bench attn_bf16                  # decode-attn accuracy
+    python validate_predict.py --bench attn_bf16                  # attention accuracy
 
 The sweep needs torch + a CUDA GPU (mxfp4 / attn also need vLLM); prediction does not.
-GEMM needs `--c-peak`/`--b-peak`; decode attention is memory-bound, so only `--b-peak`.
+GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is memory-bound (B_peak only).
 
 ## Scope / next
 
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
-- Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** + **decode flash-attention** —
-  benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`.
-- Next: **prefill attention** (compute-bound regime), then **fusedMoE** — each a new
-  op with its own descriptor feeding the same roofline ÷ efficiency split.
+- Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** + **flash-attention (hybrid: decode
+  KV-byte curve + prefill grid)** — benchmark, predictor, and validation, all via
+  `run.py --bench <op>_<dtype>`.
+- Next: **fusedMoE** (token-routed grouped GEMM) — a new op with its own descriptor
+  feeding the same roofline ÷ efficiency split.

@@ -2,18 +2,18 @@
 
     python3 run.py --bench gemm_bf16   --c-peak 165 --b-peak 1008   # RTX 4090
     python3 run.py --bench gemm_mxfp4  --c-peak 165 --b-peak 1008   # w4a16 (vLLM Marlin)
-    python3 run.py --bench attn_bf16                 --b-peak 1008   # decode flash-attn
+    python3 run.py --bench attn_bf16   --c-peak 165 --b-peak 1008   # flash-attn (decode+prefill)
     python3 run.py --bench gemm_bf16 --shapes k2048_n4096 --c-peak 165 --b-peak 1008
 
 --bench is <op>_<dtype>: gemm_bf16 / gemm_fp16 go through torch's F.linear (cuBLAS /
 cuBLASLt / CUTLASS per shape); gemm_mxfp4 goes through the vLLM Marlin w4a16 kernel;
-attn_bf16 sweeps decode flash-attention (vLLM FlashAttention, paged KV). Each writes
-its own results file.
+attn_bf16 sweeps flash-attention (vLLM FlashAttention, paged KV) — a decode KV-byte
+curve plus a prefill (S_q, S_kv, R·H) × D grid. Each writes its own results file.
 
-GEMM needs the theoretical roofline ceiling via --c-peak (TFLOP/s) and --b-peak (GB/s).
-Decode attention is always memory-bound, so it needs only --b-peak. The ceiling's
-absolute scale cancels in the predictor (it only normalizes the efficiency factor).
-Needs torch + a CUDA GPU.
+GEMM and prefill attention need the theoretical roofline ceiling via --c-peak (TFLOP/s)
+and --b-peak (GB/s); decode attention is always memory-bound, so --b-peak carries it. The
+ceiling's absolute scale cancels in the predictor (it only normalizes the efficiency
+factor). Needs torch + a CUDA GPU.
 """
 from __future__ import annotations
 
@@ -27,29 +27,26 @@ import torch
 from gemm import DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
-def _run_decode_attn(args, props, dtype: str) -> None:
-    """Decode flash-attention: sweep the KV-byte grid, write the 1-D efficiency curve."""
+def _run_attn(args, props, dtype: str) -> None:
+    """Flash-attention: decode KV-byte curve + prefill (S_q, S_kv, R*H) x D grid."""
     import vllm
-    from attn import (DECODE_CONFIG, DECODE_L_GRID, decode_roofline_residual,
-                      run_decode_sweep)
-    b_peak = args.b_peak
-    print("\n== attn_decode (vLLM FlashAttention, paged KV) ==")
-    recs = run_decode_sweep(DECODE_L_GRID, dtype=dtype, device=args.device,
-                            iters=args.iters, warmup=args.warmup, **DECODE_CONFIG)
-    decode_roofline_residual(recs, b_peak)
-    achieved_b = max(r.gbps for r in recs)
-    print(f"  B_peak (input): {b_peak:.0f} GB/s   achieved: {achieved_b:.0f} GB/s")
-    print(f"  eff = f(KV bytes): {recs[0].efficiency:.2f} @ {recs[0].kv_mb:.0f}MB"
-          f" .. {recs[-1].efficiency:.2f} @ {recs[-1].kv_mb:.0f}MB")
-    out = Path(args.out or f"results/attn_decode_{props.name.replace(' ', '_')}.json")
+    from attn import run_full_attn_sweep
+    print("\n== attn (vLLM FlashAttention, paged KV) ==")
+    decode, grid = run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
+                                       device=args.device, iters=args.iters, warmup=args.warmup)
+    print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
+    print(f"  decode curve {len(decode)} pts ({decode[0].efficiency:.2f}..{decode[-1].efficiency:.2f})"
+          f"   prefill grid {len(grid)} pts")
+    out = Path(args.out or f"results/attn_{props.name.replace(' ', '_')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "gpu": props.name,
         "lib": {"vllm": vllm.__version__},
-        "op": "attn_decode",
-        "b_peak_gbps": b_peak,
-        "achieved": {"b_gbps": round(achieved_b, 1)},
-        "attn": [asdict(r) for r in recs],
+        "op": "attn",
+        "c_peak_tflops": args.c_peak,
+        "b_peak_gbps": args.b_peak,
+        "decode": [asdict(r) for r in decode],
+        "grid": [asdict(r) for r in grid],
     }, indent=2))
     print(f"\nwrote {out}")
 
@@ -62,8 +59,8 @@ def main() -> None:
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,
                     help="Subset of SHAPES keys (gemm only; default: all).")
-    ap.add_argument("--c-peak", type=float, default=None,
-                    help="Theoretical compute TFLOP/s (required for gemm; e.g. 4090: 165).")
+    ap.add_argument("--c-peak", type=float, required=True,
+                    help="Theoretical compute peak TFLOP/s (e.g. RTX 4090: 165).")
     ap.add_argument("--b-peak", type=float, required=True,
                     help="Theoretical memory bandwidth GB/s (e.g. RTX 4090: 1008).")
     ap.add_argument("--iters", type=int, default=100)
@@ -83,11 +80,9 @@ def main() -> None:
     op, _, dtype = args.bench.partition("_")   # op in {gemm, attn}; dtype in {bf16, fp16, mxfp4}
 
     if op == "attn":
-        _run_decode_attn(args, props, dtype)
+        _run_attn(args, props, dtype)
         return
 
-    if args.c_peak is None:
-        raise SystemExit("--c-peak (TFLOP/s) is required for gemm benchmarks.")
     shapes = SHAPES if not args.shapes else {k: SHAPES[k] for k in args.shapes}
     c_peak, b_peak = args.c_peak, args.b_peak
 
