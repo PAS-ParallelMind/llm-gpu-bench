@@ -98,7 +98,7 @@ What the sweep found (RTX 4090), as *achieved* throughput against that shared
   compute-bound on the same tensor cores. The lighter weight read moves the roofline
   ridge down to small M — the whole point of w4a16.
 
-Accuracy on the 9 runnable real projections (`validate_predict.py --scheme mxfp4`):
+Accuracy on the 9 runnable real projections (`validate_predict.py --dtype mxfp4`):
 
     latency error:  median 5.9%   mean 7.5%   p90 15%
 
@@ -125,7 +125,7 @@ Activate the env (torch + CUDA), then:
     python run.py --dtypes mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 grid (Marlin)
     python predict.py --shape 2880 5120          # predict latency vs M for K,N
     python validate_predict.py                   # bf16 accuracy on real shapes
-    python validate_predict.py --scheme mxfp4    # mxfp4 accuracy
+    python validate_predict.py --dtype mxfp4     # mxfp4 accuracy
 
 The sweep needs torch + a CUDA GPU (mxfp4 also needs vLLM); prediction does not.
 Pass the GPU's theoretical peaks with `--c-peak` (TFLOP/s) and `--b-peak` (GB/s).

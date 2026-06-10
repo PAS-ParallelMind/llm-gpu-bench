@@ -6,7 +6,7 @@ predict.py for the latency using only the model-agnostic grid. Reports
 every model's shapes.
 
     python3 validate_predict.py                  # bf16 (torch F.linear) grid
-    python3 validate_predict.py --scheme mxfp4   # mxfp4 w4a16 (Marlin) grid
+    python3 validate_predict.py --dtype mxfp4    # mxfp4 w4a16 (Marlin) grid
 """
 from __future__ import annotations
 
@@ -40,27 +40,27 @@ VAL_MS = [1, 4, 16, 64, 256, 1024, 4096]
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--scheme", default="bf16", choices=["bf16", "fp16", "mxfp4"])
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "mxfp4"])
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=15)
     args = ap.parse_args()
 
-    if args.scheme == "mxfp4":
+    if args.dtype == "mxfp4":
         from marlin import run_marlin_sweep
-        dtype, glob = "mxfp4", "marlin_mxfp4_*.json"
+        glob = "marlin_mxfp4_*.json"
         recs = run_marlin_sweep(MODEL_SHAPES, VAL_MS, device=args.device,
                                 iters=args.iters, warmup=args.warmup)
     else:
-        dtype, glob = args.scheme, "gemm_*.json"
-        recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [dtype], device=args.device,
+        glob = "gemm_*.json"
+        recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [args.dtype], device=args.device,
                               iters=args.iters, warmup=args.warmup)
 
     path = args.results or str(sorted(Path("results").glob(glob))[-1])
     pred = Predictor.from_json(path)
 
-    print(f"grid: {path}   scheme {dtype}   validating {len(MODEL_SHAPES)} real projections\n")
+    print(f"grid: {path}   dtype {args.dtype}   validating {len(MODEL_SHAPES)} real projections\n")
     print(f"  {'shape':14} {'K':>6} {'N':>7} | "
           + " ".join(f"M={m:<5}" for m in VAL_MS) + "  | mean")
     all_err = []
@@ -70,7 +70,7 @@ def main() -> None:
             r = next((x for x in recs if x.shape == name and x.M == m), None)
             if r is None:                       # shape Marlin couldn't run
                 cells.append("   -  "); continue
-            pm = pred.latency_ms(m, K, N, dtype)
+            pm = pred.latency_ms(m, K, N, args.dtype)
             e = abs(pm - r.median_ms) / r.median_ms
             errs.append(e); all_err.append(e)
             cells.append(f"{e*100:5.0f}%")
