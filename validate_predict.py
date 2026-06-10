@@ -53,6 +53,21 @@ ATTN_CASES = [   # (kind, R, S_q, S_kv)
     ("chunked",  1,  256, 16384),
 ]
 
+# Mixed continuous-batching steps: n_p prefill requests + n_d decode requests in ONE
+# fused varlen call. Tests t_mixed ?= max(t_prefill, t_decode) [regimes overlap on
+# complementary resources] vs t_prefill + t_decode [no overlap / serialized]. The
+# nd-sweep holds the prefill fixed and grows the decode count through the balance point
+# (where t_prefill ≈ t_decode — the only regime where max and sum disagree much).
+MIXED_CASES = [   # (label, n_p, S_q_p, S_kv_p, n_d, S_kv_d)
+    ("decode-heavy",   1,  512,  512,   32, 4096),
+    ("prefill-heavy",  8, 2048, 2048,    4, 2048),
+    ("typical",        2, 1024, 1024,   16, 8192),
+    ("nd-sweep   8",   4, 2048, 2048,    8, 8192),
+    ("nd-sweep  32",   4, 2048, 2048,   32, 8192),
+    ("nd-sweep  64",   4, 2048, 2048,   64, 8192),
+    ("nd-sweep 128",   4, 2048, 2048,  128, 8192),
+]
+
 
 def _summary(pred_all, roof_all) -> None:
     pe, re = np.array(pred_all), np.array(roof_all)
@@ -98,9 +113,17 @@ def validate_gemm(args, dtype: str) -> None:
     _summary(pred_all, roof_all)
 
 
+def _attn_module(backend: str):
+    if backend == "flashinfer":
+        import attn_flashinfer as m
+    else:
+        import attn as m
+    return m
+
+
 def validate_attn(args) -> None:
-    import attn
-    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
+    attn = _attn_module(args.attn_backend)
+    path = args.results or str(sorted(Path("results").glob(f"attn_{args.attn_backend}_*.json"))[-1])
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   attention   {len(ATTN_CONFIGS)} head configs x "
@@ -119,10 +142,43 @@ def validate_attn(args) -> None:
     _summary(pred_all, roof_all)
 
 
+def validate_mixed(args) -> None:
+    """Mixed prefill+decode steps: is the fused-kernel time max(parts) or sum(parts)?"""
+    attn = _attn_module(args.attn_backend)
+    path = args.results or str(sorted(Path("results").glob(f"attn_{args.attn_backend}_*.json"))[-1])
+    pred = Predictor.from_json(path)
+
+    print(f"grid: {path}   mixed continuous-batching steps   "
+          f"{len(ATTN_CONFIGS)} configs x {len(MIXED_CASES)} cases\n")
+    print(f"  {'config':7} {'case':11} {'t_pf':>6} {'t_dec':>6} {'t_max':>6} {'t_sum':>6} "
+          f"{'meas':>6} | {'e_max':>5} {'e_sum':>5}")
+    emax_all, esum_all = [], []
+    for name, (H, H_kv, D) in ATTN_CONFIGS.items():
+        for label, n_p, sq_p, sk_p, n_d, sk_d in MIXED_CASES:
+            reqs = [(sq_p, sk_p)] * n_p + [(1, sk_d)] * n_d
+            meas = attn.measure_mixed_ms(reqs, H, H_kv, D, device=args.device,
+                                         iters=args.iters, warmup=args.warmup)
+            t_pf = pred.attn_latency_ms(n_p, sq_p, sk_p, H, H_kv, D)
+            t_dec = pred.attn_latency_ms(n_d, 1, sk_d, H, H_kv, D)
+            t_max, t_sum = max(t_pf, t_dec), t_pf + t_dec
+            e_max, e_sum = abs(t_max - meas) / meas, abs(t_sum - meas) / meas
+            emax_all.append(e_max); esum_all.append(e_sum)
+            print(f"  {name:7} {label:11} {t_pf:6.3f} {t_dec:6.3f} {t_max:6.3f} {t_sum:6.3f} "
+                  f"{meas:6.3f} | {e_max*100:4.0f}% {e_sum*100:4.0f}%")
+    ex, es = np.array(emax_all), np.array(esum_all)
+    print(f"\n  relative latency error over {len(ex)} mixed steps:")
+    print(f"    max(t_pf, t_dec)  [regimes overlap]:  mean {ex.mean()*100:.1f}%  "
+          f"median {np.median(ex)*100:.1f}%  max {ex.max()*100:.1f}%")
+    print(f"    t_pf + t_dec      [serialized]:       mean {es.mean()*100:.1f}%  "
+          f"median {np.median(es)*100:.1f}%  max {es.max()*100:.1f}%")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16"])
+                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed"])
+    ap.add_argument("--attn-backend", default="flash_attn",
+                    choices=["flash_attn", "flashinfer"], help="attention backend (attn only)")
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--iters", type=int, default=50)
@@ -130,7 +186,9 @@ def main() -> None:
     args = ap.parse_args()
 
     op, _, dtype = args.bench.partition("_")
-    if op == "attn":
+    if op == "attn" and dtype == "mixed":
+        validate_mixed(args)
+    elif op == "attn":
         validate_attn(args)
     else:
         validate_gemm(args, dtype)

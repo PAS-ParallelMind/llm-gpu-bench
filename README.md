@@ -107,11 +107,17 @@ Accuracy on the 9 runnable real projections (`validate_predict.py --bench gemm_m
   grid is unaffected; production pads such weights to marlin-friendly dims, and the
   sweep skips unrunnable shapes rather than crash.
 
-## attention (vLLM FlashAttention, paged KV) — hybrid
+## attention (paged KV) — hybrid, per backend
 
-A third op. vLLM runs decode + prefill through *one* unified `flash_attn_varlen_func`
-(paged KV + varlen `cu_seqlens`), so the op spans the whole `(S_q, S_kv)` plane. But the
-**efficiency has two physics regimes that want different scale variables**, so we model
+A third op. The roofline (FLOPs, bytes) is physics and **backend-independent**; only the
+*efficiency* and the continuous-batching composition depend on the attention kernel. So
+attention is **parameterized by backend** (`--attn-backend flash_attn | flashinfer`) — the
+roofline, grids, and efficiency definitions are shared (attn.py drives both via a pluggable
+kernel call; attn_flashinfer.py supplies FlashInfer's plan/run version), and each backend
+carries its own measured curve + grid. The hybrid structure below is identical for both;
+the numbers differ (see *Backends compared*).
+
+The **efficiency has two physics regimes that want different scale variables**, so we model
 them separately and route on `S_q` inside one `attn_latency_ms`:
 
 **Decode (`S_q = 1`)** — 1 query token per request reading the whole KV cache, *always*
@@ -143,11 +149,12 @@ its KV-byte curve and prefill keeps its (S_q, S_kv, R·H, D) grid.
 Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × 8 cases spanning
 decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`:
 
-    latency error:  median 3.0%   mean 6.7%   p90 20%   (roofline-only baseline: median 21%)
+    FlashAttention:  median 2.4%  mean 6.8%  p90 20%   (roofline-only baseline: median 22%)
+    FlashInfer:      median 4.7%  mean 8.3%  p90 20%   (roofline-only baseline: median 20%)
 
 - **Decode** lands ~0–11% (mixed-batch decode ~0%); model-agnostic across head config.
 - **Single-request transition** is the floor: full prefill at S_q=S_kv≈512 (R=1) hits
-  ~30% — the compute-ramp where the kernel crosses from memory- to compute-bound, steep
+  ~30–43% — the compute-ramp where the kernel crosses from memory- to compute-bound, steep
   between octave grid points, analogous to GEMM's transition sag. Batched and longer cases
   sit at 1–7%.
 - **Decode verified range.** Stress-tested across head config, paged block size, request
@@ -155,16 +162,47 @@ decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`
   **L_i ≳ 128 tokens**. In the large-batch × very-short-context corner (many requests each
   < ~128 tokens), per-request overhead pulls efficiency below the curve; documented, not modeled.
 
+### Backends compared (RTX 4090)
+
+Both backends fit the same hybrid model; the kernels differ. Swept identically via the
+pluggable call, then diffed with `compare_backends.py`:
+
+- **Decode:** FlashInfer is **1.0–2.7× faster** — it wins small/moderate batches (2.7× at
+  128 KV tokens, 1.4× at 2048) and ties at large KV (≥32k) where both saturate HBM.
+- **Prefill:** FlashInfer ahead on average (median 1.09×, mean 1.26×) but regime-split —
+  dominates **long-context, few-query** shapes (Sq≤64, Sk=16384) up to **4.4×**, while
+  FlashAttention wins **short-square** prefill (Sq≈Sk≈256) by up to ~3×.
+- **Continuous batching (mixed prefill+decode) — the decisive one.** This is where the
+  backends diverge fundamentally, because vLLM invokes them differently:
+
+      step latency vs  t_prefill + t_decode   (validate_predict.py --bench attn_mixed)
+      FlashAttention:  median 60%  mean 52%   — NOT composable
+      FlashInfer:      median 1%   mean 1.6%  — additive, fully predictable
+
+  **FlashAttention** runs the whole step through one fused `flash_attn_varlen_func`; on Ada
+  (FA2) the decode rows lose split-KV when prefill shares the call (`num_splits>1` is
+  FA3-only), so a mixed step is **1.1–5.8× slower** than FlashInfer and isn't the sum of its
+  parts. **FlashInfer** splits the step into a `BatchDecode` and a `BatchPrefill` kernel
+  (`split_decodes_and_prefills`), launched back-to-back, so decode keeps its dedicated
+  split-KV kernel and the step is `t_prefill + t_decode` to ~1.6% — the homogeneous decode
+  curve + prefill grid predict real continuous batching directly.
+
+So for vLLM serving on Ada, **FlashInfer is both faster (everywhere that matters) and the
+only backend whose continuous-batching latency composes cleanly**. (Much of the mixed-step
+gap is FA2-specific; on Hopper, FA3's AOT split scheduler would narrow it — re-measure there.)
+
 ## Files
 
     timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
     gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
     marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
-    attn.py               flash-attn sweep: decode KV-byte curve + prefill grid (torch+vLLM)
-    run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
+    attn.py               flash-attn sweep (pluggable kernel call): decode curve + prefill grid (torch+vLLM)
+    attn_flashinfer.py    FlashInfer backend: same sweep, BatchDecode/BatchPrefill wrappers (torch+flashinfer)
+    run.py                run a benchmark (--bench <op>_<dtype> [--attn-backend ...]), dump JSON (torch)
     predict.py            latency predictor (gemm trilinear / attn hybrid) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
-    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<gpu>.json
+    compare_backends.py   diff two backends' measured efficiency point-for-point (stdlib)
+    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<backend>_<gpu>.json
 
 ## Run
 
@@ -172,11 +210,14 @@ Activate the env (torch + CUDA), then:
 
     python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
     python run.py --bench gemm_mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 (Marlin)
-    python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008   # flash-attn (decode + prefill)
+    python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008                      # FlashAttention
+    python run.py --bench attn_bf16  --attn-backend flashinfer --c-peak 165 --b-peak 1008  # FlashInfer
     python predict.py --shape 2880 5120                           # gemm: latency vs M
-    python predict.py --results results/attn_*.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
-    python validate_predict.py --bench gemm_bf16                  # gemm accuracy
-    python validate_predict.py --bench attn_bf16                  # attention accuracy
+    python predict.py --results results/attn_flash_attn_*.json --attn 4 1 8192 --head 32 4 128  # attn
+    python validate_predict.py --bench gemm_bf16                              # gemm accuracy
+    python validate_predict.py --bench attn_bf16  --attn-backend flashinfer   # attention accuracy
+    python validate_predict.py --bench attn_mixed --attn-backend flashinfer   # mixed-step composition
+    python compare_backends.py                                               # FA vs FlashInfer efficiency
 
 The sweep needs torch + a CUDA GPU (mxfp4 / attn also need vLLM); prediction does not.
 GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is memory-bound (B_peak only).
@@ -186,7 +227,11 @@ GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is memory-bound (B
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
 - Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** + **flash-attention (hybrid: decode
-  KV-byte curve + prefill grid)** — benchmark, predictor, and validation, all via
-  `run.py --bench <op>_<dtype>`.
-- Next: **fusedMoE** (token-routed grouped GEMM) — a new op with its own descriptor
-  feeding the same roofline ÷ efficiency split.
+  KV-byte curve + prefill grid)** on **two backends (FlashAttention, FlashInfer)** —
+  benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`.
+- Attention is backend-parameterized because the kernel choice changes both efficiency and
+  continuous-batching composition. FlashInfer composes additively (mixed step =
+  `t_prefill + t_decode`); FlashAttention-on-Ada does not (fused-kernel decode penalty).
+- Next: **fusedMoE** (token-routed grouped GEMM); a **vLLM backend-selector helper** so the
+  suite auto-benchmarks the kernel vLLM will actually run; and the FA2 mixed-step
+  interaction model (or pin FlashInfer for predictable serving).

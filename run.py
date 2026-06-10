@@ -27,22 +27,33 @@ import torch
 from gemm import DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
+def _attn_module(backend: str):
+    """Select the attention backend implementation (same hybrid API, different kernels)."""
+    if backend == "flashinfer":
+        import attn_flashinfer as m
+    else:
+        import attn as m
+    return m
+
+
 def _run_attn(args, props, dtype: str) -> None:
     """Flash-attention: decode KV-byte curve + prefill (S_q, S_kv, R*H) x D grid."""
     import vllm
-    from attn import run_full_attn_sweep
-    print("\n== attn (vLLM FlashAttention, paged KV) ==")
-    decode, grid = run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
-                                       device=args.device, iters=args.iters, warmup=args.warmup)
+    mod = _attn_module(args.attn_backend)
+    label = {"flash_attn": "FlashAttention", "flashinfer": "FlashInfer"}[args.attn_backend]
+    print(f"\n== attn ({label}, paged KV) ==")
+    decode, grid = mod.run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
+                                           device=args.device, iters=args.iters, warmup=args.warmup)
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
     print(f"  decode curve {len(decode)} pts ({decode[0].efficiency:.2f}..{decode[-1].efficiency:.2f})"
           f"   prefill grid {len(grid)} pts")
-    out = Path(args.out or f"results/attn_{props.name.replace(' ', '_')}.json")
+    out = Path(args.out or f"results/attn_{args.attn_backend}_{props.name.replace(' ', '_')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "gpu": props.name,
         "lib": {"vllm": vllm.__version__},
         "op": "attn",
+        "backend": args.attn_backend,
         "c_peak_tflops": args.c_peak,
         "b_peak_gbps": args.b_peak,
         "decode": [asdict(r) for r in decode],
@@ -56,6 +67,9 @@ def main() -> None:
     ap.add_argument("--bench", default="gemm_bf16",
                     choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16"],
                     help="which benchmark to run (<op>_<dtype>).")
+    ap.add_argument("--attn-backend", default="flash_attn",
+                    choices=["flash_attn", "flashinfer"],
+                    help="attention backend (attn only): vLLM FA varlen or FlashInfer wrappers.")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,
                     help="Subset of SHAPES keys (gemm only; default: all).")

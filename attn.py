@@ -85,10 +85,50 @@ def _attn_call(R, Sq, Sk, H, H_kv, D, dt, dev):
 
 
 def measure_attn_ms(R, Sq, Sk, H, H_kv, D, *, dtype="bf16",
-                    device: int | torch.device = 0, iters=30, warmup=10) -> float:
-    """Median ms for one attention call (decode S_q=1 or prefill S_q>1)."""
+                    device: int | torch.device = 0, iters=30, warmup=10,
+                    call=_attn_call) -> float:
+    """Median ms for one attention call (decode S_q=1 or prefill S_q>1). `call` is the
+    kernel builder (FlashAttention here; attn_flashinfer supplies the FlashInfer one)."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
-    fn, bufs = _attn_call(R, Sq, Sk, H, H_kv, D, _DTYPES[dtype], dev)
+    fn, bufs = call(R, Sq, Sk, H, H_kv, D, _DTYPES[dtype], dev)
+    t = measure(fn, device=dev, iters=iters, warmup=warmup)
+    del fn, bufs
+    torch.cuda.empty_cache()
+    return t.median_ms
+
+
+def _mixed_attn_call(reqs, H, H_kv, D, dt, dev):
+    """One fused varlen flash-attn call over heterogeneous requests — what a vLLM
+    continuous-batching step actually launches. `reqs`: list of (S_q_i, S_kv_i);
+    decode requests have S_q_i = 1, prefill S_q_i > 1. Query rows are varlen-packed
+    (Σ S_q_i) and each request keeps its own paged-KV block range."""
+    sqs = [sq for sq, _ in reqs]
+    sks = [sk for _, sk in reqs]
+    nblks = [(sk + BLOCK_SIZE - 1) // BLOCK_SIZE for sk in sks]
+    nb = sum(nblks)
+    q = torch.randn(sum(sqs), H, D, device=dev, dtype=dt)
+    kc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
+    vc = torch.randn(nb, BLOCK_SIZE, H_kv, D, device=dev, dtype=dt)
+    bt = torch.zeros(len(reqs), max(nblks), dtype=torch.int32)   # (R, max_blocks)
+    off = 0
+    for i, n in enumerate(nblks):
+        bt[i, :n] = torch.arange(off, off + n, dtype=torch.int32)
+        off += n
+    cu = torch.zeros(len(reqs) + 1, dtype=torch.int32)
+    cu[1:] = torch.tensor(sqs, dtype=torch.int32).cumsum(0)
+    su = torch.tensor(sks, device=dev, dtype=torch.int32)
+    bt, cu = bt.to(dev), cu.to(dev)
+    fn = lambda: flash_attn_varlen_func(
+        q=q, k=kc, v=vc, max_seqlen_q=max(sqs), cu_seqlens_q=cu, max_seqlen_k=max(sks),
+        seqused_k=su, softmax_scale=1.0 / math.sqrt(D), causal=True, block_table=bt)
+    return fn, (q, kc, vc)
+
+
+def measure_mixed_ms(reqs, H, H_kv, D, *, dtype="bf16",
+                     device: int | torch.device = 0, iters=30, warmup=10) -> float:
+    """Median ms for one fused call mixing prefill (S_q>1) and decode (S_q=1) requests."""
+    dev = torch.device("cuda", device) if isinstance(device, int) else device
+    fn, bufs = _mixed_attn_call(reqs, H, H_kv, D, _DTYPES[dtype], dev)
     t = measure(fn, device=dev, iters=iters, warmup=warmup)
     del fn, bufs
     torch.cuda.empty_cache()
@@ -118,7 +158,7 @@ class AttnRecord:
 
 
 def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
-                     device: int | torch.device = 0, iters=30, warmup=10):
+                     device: int | torch.device = 0, iters=30, warmup=10, call=_attn_call):
     """S_q=1 sweep over context L -> the 1-D f_decode(KV bytes) curve (memory-bound)."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
@@ -127,7 +167,7 @@ def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
     recs: list[DecodeRecord] = []
     pbar = progress(len(Ls), "decode")
     for L in Ls:
-        fn, bufs = _attn_call(R, 1, L, H, H_kv, D, dt, dev)
+        fn, bufs = call(R, 1, L, H, H_kv, D, dt, dev)
         t = measure(fn, device=dev, iters=iters, warmup=warmup)
         nbytes = kv_bytes(R * L, H_kv, D, elem)
         sec = t.median_ms * 1e-3
@@ -142,7 +182,7 @@ def run_decode_sweep(Ls, *, b_peak, H=32, H_kv=8, D=128, R=8, dtype="bf16",
 
 
 def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf16",
-                   device: int | torch.device = 0, iters=30, warmup=10):
+                   device: int | torch.device = 0, iters=30, warmup=10, call=_attn_call):
     """Prefill grid: the (S_q <= S_kv) plane x R*H for one head-dim D (S_q > 1)."""
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
@@ -153,7 +193,7 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
     pbar = progress(len(work), f"prefill D={D}")
     for sq, sk, rh in work:
         R = max(rh // H, 1)
-        fn, bufs = _attn_call(R, sq, sk, H, H_kv, D, dt, dev)
+        fn, bufs = call(R, sq, sk, H, H_kv, D, dt, dev)
         t = measure(fn, device=dev, iters=iters, warmup=warmup)
         tc = attn_flops(R, sq, sk, H, D) / C
         tm = attn_bytes(R, sq, sk, H, H_kv, D, elem) / B
@@ -169,13 +209,14 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
     return recs
 
 
-def run_full_attn_sweep(*, c_peak, b_peak, dtype="bf16", device=0, iters=30, warmup=10):
+def run_full_attn_sweep(*, c_peak, b_peak, dtype="bf16", device=0, iters=30, warmup=10,
+                        call=_attn_call):
     """Hybrid sweep: the decode KV-byte curve + the prefill grid over all head dims D."""
-    decode = run_decode_sweep(DECODE_L_GRID, b_peak=b_peak, dtype=dtype,
-                              device=device, iters=iters, warmup=warmup, **DECODE_CONFIG)
+    decode = run_decode_sweep(DECODE_L_GRID, b_peak=b_peak, dtype=dtype, device=device,
+                              iters=iters, warmup=warmup, call=call, **DECODE_CONFIG)
     grid: list[AttnRecord] = []
     for D in ATTN_D_GRID:
         grid += run_attn_sweep(ATTN_SQ_GRID, ATTN_SK_GRID, ATTN_RH_GRID, D=D,
-                               c_peak=c_peak, b_peak=b_peak, dtype=dtype,
-                               device=device, iters=iters, warmup=warmup)
+                               c_peak=c_peak, b_peak=b_peak, dtype=dtype, device=device,
+                               iters=iters, warmup=warmup, call=call)
     return decode, grid
