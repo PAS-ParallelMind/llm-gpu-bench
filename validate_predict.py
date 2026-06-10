@@ -69,13 +69,19 @@ MIXED_CASES = [   # (label, n_p, S_q_p, S_kv_p, n_d, S_kv_d)
 ]
 
 
-def _summary(pred_all, roof_all) -> None:
+def _summary(pred_all, roof_all, meas_all=None) -> None:
     pe, re = np.array(pred_all), np.array(roof_all)
     print(f"\n  relative latency error over {len(pe)} points:")
     print(f"    roofline only (no grid):  mean {re.mean()*100:.1f}%  median {np.median(re)*100:.1f}%  "
           f"p90 {np.percentile(re,90)*100:.1f}%  max {re.max()*100:.1f}%")
     print(f"    with efficiency grid:     mean {pe.mean()*100:.1f}%  median {np.median(pe)*100:.1f}%  "
           f"p90 {np.percentile(pe,90)*100:.1f}%  max {pe.max()*100:.1f}%")
+    if meas_all is not None:
+        # weight each case by its measured latency, so heavy (high-latency) workloads
+        # dominate -- this reflects real serving cost, where light cases are negligible.
+        w = np.array(meas_all)
+        print(f"    latency-weighted (sum|pred-meas| / sum meas; heavy steps dominate):  "
+              f"grid {(pe*w).sum()/w.sum()*100:.1f}%   roofline {(re*w).sum()/w.sum()*100:.1f}%")
 
 
 def validate_gemm(args, dtype: str) -> None:
@@ -94,7 +100,7 @@ def validate_gemm(args, dtype: str) -> None:
     print(f"grid: {path}   {dtype}   validating {len(MODEL_SHAPES)} real projections\n")
     print(f"  {'shape':14} {'K':>6} {'N':>7} | "
           + " ".join(f"M={m:<5}" for m in VAL_MS) + "  | pred  roof")
-    pred_all, roof_all = [], []
+    pred_all, roof_all, meas_all = [], [], []
     for name, (K, N) in MODEL_SHAPES.items():
         cells, pe, re = [], [], []
         for m in VAL_MS:
@@ -105,12 +111,13 @@ def validate_gemm(args, dtype: str) -> None:
             ep = abs(pred.latency_ms(m, K, N, dtype) - meas) / meas
             er = abs(pred.roofline_ms(m, K, N, dtype) - meas) / meas
             cells.append(f"{ep*100:5.0f}%")
-            pe.append(ep); re.append(er); pred_all.append(ep); roof_all.append(er)
+            pe.append(ep); re.append(er)
+            pred_all.append(ep); roof_all.append(er); meas_all.append(meas)
         tail = (f"{np.mean(pe)*100:4.0f}%  {np.mean(re)*100:4.0f}%" if pe
                 else "n/a (unsupported)")
         print(f"  {name:14} {K:>6} {N:>7} | " + " ".join(f"{c:>7}" for c in cells)
               + f"  | {tail}")
-    _summary(pred_all, roof_all)
+    _summary(pred_all, roof_all, meas_all)
 
 
 def validate_attn(args) -> None:
@@ -120,18 +127,18 @@ def validate_attn(args) -> None:
 
     print(f"grid: {path}   attention   {len(ATTN_CONFIGS)} head configs x "
           f"{len(ATTN_CASES)} cases (decode / prefill / chunked)\n")
-    print(f"  {'config':8} {'kind':8} {'R':>3} {'S_q':>5} {'S_kv':>6} | {'pred':>5} {'roof':>5}")
-    pred_all, roof_all = [], []
+    print(f"  {'config':8} {'kind':8} {'R':>3} {'S_q':>5} {'S_kv':>6} | {'pred':>5} {'roof':>5} | {'meas':>9}")
+    pred_all, roof_all, meas_all = [], [], []
     for name, (H, H_kv, D) in ATTN_CONFIGS.items():
         for kind, R, Sq, Sk in ATTN_CASES:
             meas = attn.measure_attn_ms(R, Sq, Sk, H, H_kv, D, device=args.device,
                                         iters=args.iters, warmup=args.warmup)
             ep = abs(pred.attn_latency_ms(R, Sq, Sk, H, H_kv, D) - meas) / meas
             er = abs(pred.attn_roofline_ms(R, Sq, Sk, H, H_kv, D) - meas) / meas
-            pred_all.append(ep); roof_all.append(er)
+            pred_all.append(ep); roof_all.append(er); meas_all.append(meas)
             print(f"  {name:8} {kind:8} {R:>3} {Sq:>5} {Sk:>6} | "
-                  f"{ep*100:>4.0f}% {er*100:>4.0f}%")
-    _summary(pred_all, roof_all)
+                  f"{ep*100:>4.0f}% {er*100:>4.0f}% | {meas:8.3f} ms")
+    _summary(pred_all, roof_all, meas_all)
 
 
 def validate_mixed(args) -> None:
