@@ -1,18 +1,19 @@
-"""Run the GEMM grid sweep, score efficiency vs the theoretical roofline, dump JSON.
+"""Run a kernel benchmark, score efficiency vs the roofline, dump JSON.
 
-    python3 run.py --dtypes bf16  --c-peak 165 --b-peak 1008    # RTX 4090, bf16
-    python3 run.py --dtypes mxfp4 --c-peak 165 --b-peak 1008    # w4a16 (vLLM Marlin)
-    python3 run.py --shapes k2048_n4096 --dtypes bf16 --c-peak 165 --b-peak 1008
+    python3 run.py --bench gemm_bf16   --c-peak 165 --b-peak 1008   # RTX 4090
+    python3 run.py --bench gemm_mxfp4  --c-peak 165 --b-peak 1008   # w4a16 (vLLM Marlin)
+    python3 run.py --bench attn_bf16                 --b-peak 1008   # decode flash-attn
+    python3 run.py --bench gemm_bf16 --shapes k2048_n4096 --c-peak 165 --b-peak 1008
 
-bf16/fp16 go through torch's F.linear (torch picks the GEMM backend —
-cuBLAS / cuBLASLt / CUTLASS — per shape); mxfp4 goes through the vLLM Marlin w4a16
-kernel (needs vLLM) with its own byte model. Run mxfp4 separately from bf16/fp16 —
-different kernels and byte models, so different output files.
+--bench is <op>_<dtype>: gemm_bf16 / gemm_fp16 go through torch's F.linear (cuBLAS /
+cuBLASLt / CUTLASS per shape); gemm_mxfp4 goes through the vLLM Marlin w4a16 kernel;
+attn_bf16 sweeps decode flash-attention (vLLM FlashAttention, paged KV). Each writes
+its own results file.
 
-The roofline ceiling is the GPU's theoretical peak, passed via --c-peak (tensor-core
-TFLOP/s) and --b-peak (memory GB/s). Its absolute scale cancels in the predictor (it
-only normalizes the efficiency factor), so any consistent value works. Needs torch +
-a CUDA GPU.
+GEMM needs the theoretical roofline ceiling via --c-peak (TFLOP/s) and --b-peak (GB/s).
+Decode attention is always memory-bound, so it needs only --b-peak. The ceiling's
+absolute scale cancels in the predictor (it only normalizes the efficiency factor).
+Needs torch + a CUDA GPU.
 """
 from __future__ import annotations
 
@@ -26,15 +27,43 @@ import torch
 from gemm import DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
+def _run_decode_attn(args, props, dtype: str) -> None:
+    """Decode flash-attention: sweep the KV-byte grid, write the 1-D efficiency curve."""
+    import vllm
+    from attn import (DECODE_CONFIG, DECODE_L_GRID, decode_roofline_residual,
+                      run_decode_sweep)
+    b_peak = args.b_peak
+    print("\n== attn_decode (vLLM FlashAttention, paged KV) ==")
+    recs = run_decode_sweep(DECODE_L_GRID, dtype=dtype, device=args.device,
+                            iters=args.iters, warmup=args.warmup, **DECODE_CONFIG)
+    decode_roofline_residual(recs, b_peak)
+    achieved_b = max(r.gbps for r in recs)
+    print(f"  B_peak (input): {b_peak:.0f} GB/s   achieved: {achieved_b:.0f} GB/s")
+    print(f"  eff = f(KV bytes): {recs[0].efficiency:.2f} @ {recs[0].kv_mb:.0f}MB"
+          f" .. {recs[-1].efficiency:.2f} @ {recs[-1].kv_mb:.0f}MB")
+    out = Path(args.out or f"results/attn_decode_{props.name.replace(' ', '_')}.json")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "gpu": props.name,
+        "lib": {"vllm": vllm.__version__},
+        "op": "attn_decode",
+        "b_peak_gbps": b_peak,
+        "achieved": {"b_gbps": round(achieved_b, 1)},
+        "attn": [asdict(r) for r in recs],
+    }, indent=2))
+    print(f"\nwrote {out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--bench", default="gemm_bf16",
+                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16"],
+                    help="which benchmark to run (<op>_<dtype>).")
     ap.add_argument("--device", type=int, default=0)
-    ap.add_argument("--dtypes", nargs="+", default=["bf16", "fp16"],
-                    help="bf16/fp16 (torch F.linear) or mxfp4 (Marlin w4a16); not mixed.")
     ap.add_argument("--shapes", nargs="+", default=None,
-                    help="Subset of SHAPES keys (default: all).")
-    ap.add_argument("--c-peak", type=float, required=True,
-                    help="Theoretical compute peak TFLOP/s (e.g. RTX 4090: 165).")
+                    help="Subset of SHAPES keys (gemm only; default: all).")
+    ap.add_argument("--c-peak", type=float, default=None,
+                    help="Theoretical compute TFLOP/s (required for gemm; e.g. 4090: 165).")
     ap.add_argument("--b-peak", type=float, required=True,
                     help="Theoretical memory bandwidth GB/s (e.g. RTX 4090: 1008).")
     ap.add_argument("--iters", type=int, default=100)
@@ -51,41 +80,37 @@ def main() -> None:
     print(f"GPU: {props.name} | {props.total_memory / 1024**3:.1f} GB | "
           f"L2 {l2_mb:.0f} MB | torch {torch.__version__}")
 
+    op, _, dtype = args.bench.partition("_")   # op in {gemm, attn}; dtype in {bf16, fp16, mxfp4}
+
+    if op == "attn":
+        _run_decode_attn(args, props, dtype)
+        return
+
+    if args.c_peak is None:
+        raise SystemExit("--c-peak (TFLOP/s) is required for gemm benchmarks.")
     shapes = SHAPES if not args.shapes else {k: SHAPES[k] for k in args.shapes}
-
-    fp_dtypes = [d for d in args.dtypes if d in ("bf16", "fp16")]
-    quant = [d for d in args.dtypes if d == "mxfp4"]
-    if fp_dtypes and quant:
-        raise SystemExit("run mxfp4 separately from bf16/fp16 — different kernel "
-                         "and byte model (different output files).")
-    if not fp_dtypes and not quant:
-        raise SystemExit(f"unknown --dtypes {args.dtypes}; use bf16, fp16, or mxfp4.")
-
     c_peak, b_peak = args.c_peak, args.b_peak
 
-    if quant:
+    if dtype == "mxfp4":
         # mxfp4 w4a16 via vLLM Marlin (imported lazily — pulls in vLLM).
         import vllm
         from marlin import BYTES_MODEL, marlin_roofline_residual, run_marlin_sweep
-        print("\n== mxfp4 gemm (Marlin w4a16) ==")
+        print("\n== gemm_mxfp4 (Marlin w4a16) ==")
         recs = run_marlin_sweep(shapes, DEFAULT_MS,
                                 device=dev, iters=args.iters, warmup=args.warmup)
         marlin_roofline_residual(recs, c_peak, b_peak)
-        c_peaks = {"mxfp4": c_peak}
-        scheme, bytes_model = "mxfp4_w4a16", BYTES_MODEL
+        c_peaks, bytes_model = {"mxfp4": c_peak}, BYTES_MODEL
         lib = {"vllm": vllm.__version__}                  # the Marlin kernel ships in vLLM
         default_out = f"results/marlin_mxfp4_{props.name.replace(' ', '_')}.json"
     else:
         print("\n== gemm (torch F.linear) ==")
-        recs = run_gemm_sweep(shapes, DEFAULT_MS, fp_dtypes,
+        recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
                               device=dev, iters=args.iters, warmup=args.warmup)
-        roofline_residual(recs, {dt: (c_peak, "input") for dt in fp_dtypes}, b_peak)
-        c_peaks = {dt: c_peak for dt in fp_dtypes}
-        scheme, bytes_model = "+".join(fp_dtypes), {"w": 2.0, "a": 2.0, "o": 2.0}
+        roofline_residual(recs, {dtype: (c_peak, "input")}, b_peak)
+        c_peaks, bytes_model = {dtype: c_peak}, {"w": 2.0, "a": 2.0, "o": 2.0}
         lib = {"torch": torch.__version__}                # the F.linear GEMM ships in torch
         default_out = f"results/gemm_{props.name.replace(' ', '_')}.json"
 
-    # achieved throughput, as a sanity check against the input ceiling
     achieved_c = max(r.tflops for r in recs)
     achieved_b = max(r.gbps for r in recs)
     print(f"  roofline ceiling (input):  C_peak {c_peak:7.0f} TFLOP/s   B_peak {b_peak:6.0f} GB/s")
@@ -103,7 +128,8 @@ def main() -> None:
     out.write_text(json.dumps({
         "gpu": props.name,
         "lib": lib,
-        "scheme": scheme,
+        "bench": args.bench,
+        "op": op,
         "b_peak_gbps": b_peak,
         "c_peak": c_peaks,
         "achieved": {"c_tflops": round(achieved_c, 1), "b_gbps": round(achieved_b, 1)},

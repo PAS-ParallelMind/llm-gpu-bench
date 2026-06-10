@@ -98,7 +98,7 @@ What the sweep found (RTX 4090), as *achieved* throughput against that shared
   compute-bound on the same tensor cores. The lighter weight read moves the roofline
   ridge down to small M — the whole point of w4a16.
 
-Accuracy on the 9 runnable real projections (`validate_predict.py --dtype mxfp4`):
+Accuracy on the 9 runnable real projections (`validate_predict.py --bench gemm_mxfp4`):
 
     latency error:  median 5.9%   mean 7.5%   p90 15%
 
@@ -107,33 +107,65 @@ Accuracy on the 9 runnable real projections (`validate_predict.py --dtype mxfp4`
   grid is unaffected; production pads such weights to marlin-friendly dims, and the
   sweep skips unrunnable shapes rather than crash.
 
+## decode attention (vLLM FlashAttention, paged KV)
+
+A third op, and the simplest. Decode attention (1 query token per request, reading
+the whole KV cache) is *always* memory-bound — arithmetic intensity = 2·(H/H_kv)/elem
+(the GQA ratio), far below the ridge. Measurement shows efficiency depends only on
+the **total KV bytes** streamed — not on head config (H, H_kv, D), request count, or
+how the bytes split across requests' context lengths (a skewed mixed batch matches a
+uniform one with the same total KV bytes). So a single **1-D curve `eff = f(KV bytes)`**
+predicts decode attention for any model and any continuous batch:
+
+    t = (KV_bytes / B_peak) / f(KV_bytes),   KV_bytes = 2·elem·Σ_i ⌈L_i/16⌉·16·H_kv·D
+
+vLLM's FlashAttention backend runs prefill+decode through one unified
+`flash_attn_varlen_func` (paged KV + cu_seqlens), so decode is the S_q=1 slice. The
+curve runs **0.03 (1 MB KV) → 0.92 (2 GB KV)** — paged-KV reads saturate HBM more
+slowly than GEMM's contiguous weight read, so it's its own curve.
+
+Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × (batch, context),
+`validate_predict.py --bench attn_bf16`:
+
+    latency error:  median 1.7%   mean 3.7%   (roofline-only baseline: median 31%)
+
+- **Verified range.** Stress-tested across head config, paged block size, request
+  count, and batch composition — the 1-D collapse holds for per-request context
+  **L_i ≳ 128 tokens** (covers realistic decode). In the large-batch × very-short-context
+  corner (many requests each < ~128 tokens), per-request overhead pulls efficiency below
+  the curve, so it over-predicts there; documented, not modeled.
+
 ## Files
 
-    timing.py             CUDA-event timing, L2 flush, robust stats     (torch)
+    timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
     gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
     marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
-    run.py                sweep a scheme, derive ceilings, dump JSON      (torch)
-    predict.py            trilinear latency predictor (any scheme)       (stdlib)
-    validate_predict.py   predicted vs measured on real projections       (torch)
-    results/              grid JSON  (gemm_<gpu>.json, marlin_mxfp4_<gpu>.json)
+    attn.py               decode flash-attn sweep + KV-byte curve        (torch+vLLM)
+    run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
+    predict.py            latency predictor (gemm trilinear / attn curve) (stdlib)
+    validate_predict.py   predicted vs measured on real workloads         (torch)
+    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_decode_<gpu>.json
 
 ## Run
 
 Activate the env (torch + CUDA), then:
 
-    python run.py --dtypes bf16  --c-peak 165 --b-peak 1008   # bf16 grid → gemm_<gpu>.json
-    python run.py --dtypes mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 grid (Marlin)
-    python predict.py --shape 2880 5120          # predict latency vs M for K,N
-    python validate_predict.py                   # bf16 accuracy on real shapes
-    python validate_predict.py --dtype mxfp4     # mxfp4 accuracy
+    python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
+    python run.py --bench gemm_mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 (Marlin)
+    python run.py --bench attn_bf16               --b-peak 1008   # decode flash-attn curve
+    python predict.py --shape 2880 5120                           # gemm: latency vs M
+    python predict.py --results results/attn_decode_*.json --head 4 128 --kv 131072  # attn
+    python validate_predict.py --bench gemm_bf16                  # gemm accuracy
+    python validate_predict.py --bench attn_bf16                  # decode-attn accuracy
 
-The sweep needs torch + a CUDA GPU (mxfp4 also needs vLLM); prediction does not.
-Pass the GPU's theoretical peaks with `--c-peak` (TFLOP/s) and `--b-peak` (GB/s).
+The sweep needs torch + a CUDA GPU (mxfp4 / attn also need vLLM); prediction does not.
+GEMM needs `--c-peak`/`--b-peak`; decode attention is memory-bound, so only `--b-peak`.
 
 ## Scope / next
 
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
-- Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** grids + predictor.
-- Next: fp16 (same F.linear path), then **flash-attention** and **fusedMoE** — each a
-  new op with its own shape descriptor feeding the same roofline ÷ efficiency split.
+- Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** + **decode flash-attention** —
+  benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`.
+- Next: **prefill attention** (compute-bound regime), then **fusedMoE** — each a new
+  op with its own descriptor feeding the same roofline ÷ efficiency split.
