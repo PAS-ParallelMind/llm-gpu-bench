@@ -1,9 +1,9 @@
 # llm-gpu-bench
 
 A benchmark suite that characterises a GPU's **achievable** compute/memory
-throughput and turns it into **LLM inference latency predictions**. It measures
-the ceilings the GPU actually reaches (not datasheet peaks) and the *efficiency
-factor* of real kernel shapes, so a roofline model can predict latency for shapes
+throughput and turns it into **LLM inference latency predictions**. It measures the
+*efficiency factor* of real kernel shapes — the gap between the GPU's theoretical
+roofline and what it actually reaches — so the model can predict latency for shapes
 it never measured.
 
 ## Idea
@@ -12,10 +12,11 @@ Latency of a GEMM (and, later, attention / MoE) is split into two measured piece
 
     t = roofline(C_peak, B_peak) / efficiency(shape)
 
-1. **Ceilings** — `C_peak[dtype]` (achievable TFLOP/s, from the GEMM compute
-   plateau) and `B_peak` (achievable GB/s, from the same sweep's small-M,
-   large-weight points, which are HBM-read-bound). They set the floor
-   `t_roof = max(FLOPs / C_peak, Bytes / B_peak)`.
+1. **Ceilings** — the GPU's **theoretical** peaks `C_peak[dtype]` (tensor-core
+   TFLOP/s) and `B_peak` (memory GB/s), passed via `--c-peak` / `--b-peak`, setting
+   the floor `t_roof = max(FLOPs / C_peak, Bytes / B_peak)`. Their absolute scale
+   *cancels* in the predictor (it only normalizes the efficiency factor), so any
+   consistent value works.
 2. **Efficiency factor** `efficiency = t_roof / t_measured ∈ (0,1]` — how close the
    real kernel gets to the floor. This is what varies with shape, so it is what we
    sample and interpolate.
@@ -80,14 +81,18 @@ matmul, so only the **byte model** changes — the weight read is ~3.8× lighter
 
     bytes = 0.53125·N·K  (4-bit weight + 1-byte scale/32)  +  2·(M·K + M·N)
 
-The predictor is unchanged; each scheme just carries its own ceilings and a
-`bytes_model` in the results JSON (`predict.py` reads it; bf16 defaults to 2/2/2).
+The predictor is unchanged; each scheme just carries its `bytes_model` in the
+results JSON (`predict.py` reads it; bf16 defaults to 2/2/2). The theoretical
+ceiling is **shared with bf16** — mxfp4 dequants to the same bf16 tensor cores and
+the memory ceiling is the same GDDR6X — so all the kernel-specific behaviour lives
+in the efficiency factor.
 
-What the sweep found (RTX 4090):
+What the sweep found (RTX 4090), as *achieved* throughput against that shared
+165 TFLOP/s · 1008 GB/s ceiling:
 
-- **C_peak[mxfp4] ≈ 171 TFLOP/s** — same as bf16; dequant is fully hidden at large M.
-- **B_peak[mxfp4] ≈ 904 GB/s** effective weight-read — the biggest weights approach
-  HBM, but moderate ones run ~600 GB/s (dequant-limited); the efficiency factor
+- **Compute ≈ 171 TFLOP/s achieved** — matches bf16; dequant is fully hidden at large M.
+- **Memory ≈ 904 GB/s achieved** weight-read — the biggest weights approach the 1008
+  ceiling, but moderate ones run ~600 GB/s (dequant-limited); the efficiency factor
   absorbs the shape dependence.
 - **~3× decode speedup vs bf16** (M ≲ 16), vanishing by M ≈ 1024 where both are
   compute-bound on the same tensor cores. The lighter weight read moves the roofline
@@ -116,13 +121,14 @@ Accuracy on the 9 runnable real projections (`validate_predict.py --scheme mxfp4
 
 Activate the env (torch + CUDA), then:
 
-    python run.py --dtypes bf16                  # bf16 grid → results/gemm_<gpu>.json
-    python run.py --dtypes mxfp4                 # mxfp4 w4a16 grid (Marlin)
+    python run.py --dtypes bf16  --c-peak 165 --b-peak 1008   # bf16 grid → gemm_<gpu>.json
+    python run.py --dtypes mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 grid (Marlin)
     python predict.py --shape 2880 5120          # predict latency vs M for K,N
     python validate_predict.py                   # bf16 accuracy on real shapes
     python validate_predict.py --scheme mxfp4    # mxfp4 accuracy
 
 The sweep needs torch + a CUDA GPU (mxfp4 also needs vLLM); prediction does not.
+Pass the GPU's theoretical peaks with `--c-peak` (TFLOP/s) and `--b-peak` (GB/s).
 
 ## Scope / next
 

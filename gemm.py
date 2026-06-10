@@ -123,22 +123,12 @@ def run_gemm_sweep(
     return recs
 
 
-def derive_c_peak(recs: list[GemmRecord]) -> dict[str, tuple[float, str]]:
-    """Achieved compute ceiling per dtype = max observed TFLOP/s (large-M plateau)."""
-    out: dict[str, tuple[float, str]] = {}
-    for r in recs:
-        cur = out.get(r.dtype)
-        if cur is None or r.tflops > cur[0]:
-            out[r.dtype] = (r.tflops, f"{r.shape} M={r.M}")
-    return out
-
-
 def roofline_residual(
     recs: list[GemmRecord],
     c_peak: dict[str, tuple[float, str]],
     b_peak_gbps: float,
 ) -> None:
-    """Fill in predicted_ms / residual using measured C_peak and B_peak (in place)."""
+    """Fill in predicted_ms / residual using the C_peak / B_peak ceiling (in place)."""
     b = b_peak_gbps * 1e9
     for r in recs:
         c = c_peak[r.dtype][0] * 1e12
