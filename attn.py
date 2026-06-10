@@ -56,10 +56,19 @@ ATTN_SK_GRID = [16, 64, 256, 1024, 4096, 16384]
 ATTN_RH_GRID = [32, 128, 512]
 ATTN_D_GRID = [64, 128, 256]
 
-# FlashInfer kernel candidates tried per point (best wins; unsupported ones are skipped).
-# Decode: (backend, use_tensor_cores).  Prefill: backend name.
-DECODE_CANDIDATES = [("fa2", False), ("fa2", True), ("trtllm-gen", False)]
-PREFILL_CANDIDATES = ["fa2", "fa3", "cutlass", "trtllm-gen"]
+# FlashInfer paged-KV kernel candidates tried per point (best wins; unsupported skipped).
+# Decode is (backend, use_tensor_cores); prefill is just the backend name. Hard-coded to the
+# full viable set; the try/skip in _best_call discovers which run on the current GPU:
+#   decode : fa2, trtllm-gen (Blackwell SM100), cudnn       (all confirmed selectable)
+#   prefill: fa2, fa3 (Hopper SM90), trtllm-gen (Blackwell)
+# Excluded (can't run via these paged wrappers, any GPU): prefill cudnn (needs the block-table
+# plan form, not the indptr/indices one we use), cute-dsl ("not yet supported for paged KV"),
+# cutlass (ragged wrapper only).
+# use_tensor_cores only toggles the fa2 decode path (CUDA-core kernel vs the tensor-core
+# seqlen_q=1 "prefill" path — faster at large GQA group); trtllm-gen/cudnn pick their own
+# kernels, so the flag is a don't-care for them (each listed once).
+DECODE_CANDIDATES = [("fa2", False), ("fa2", True), ("trtllm-gen", False), ("cudnn", False)]
+PREFILL_CANDIDATES = ["fa2", "fa3", "trtllm-gen"]
 
 
 def _name(cand) -> str:
