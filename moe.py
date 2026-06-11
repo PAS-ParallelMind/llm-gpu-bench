@@ -29,7 +29,7 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 # Variables: M tokens, E experts, top_k experts/token, H hidden (GEMM K), I intermediate.
 # Model-agnostic grid: routed tokens via M (decode->prefill) x experts E x hidden H x intermediate I.
-MOE_M_GRID = [1, 8, 64, 512, 4096]          # T = M*top_k spans 8 .. 32768 at top_k=8
+MOE_M_GRID = [1, 4, 16, 64, 256, 1024, 4096]   # x4 steps: T = M*top_k spans 8 .. 32768 at top_k=8
 MOE_E_GRID = [8, 32, 128]
 MOE_H_GRID = [2048, 4096, 8192]             # brackets real hidden (2048, 2880)
 MOE_I_GRID = [512, 1024, 2048, 4096]        # brackets real intermediate (768, 2880)
