@@ -73,7 +73,10 @@ def _moe_call(M, E, top_k, H, I, dt, dev, quant="bf16"):
     x = torch.randn(M, H, device=dev, dtype=dt)
     tw, tid = _uniform_routing(M, E, top_k, dev)
     if quant == "mxfp4":
-        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+        try:
+            from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
+        except ModuleNotFoundError:   # vLLM <= 0.16: flat layout, no experts/ subpackage
+            from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
         from vllm.scalar_type import scalar_types
         (w1q, w1s), (w2q, w2s) = _marlin_moe_weights(E, H, I, dev)
         qid = scalar_types.float4_e2m1f.id          # mxfp4 weights, bf16 activations
