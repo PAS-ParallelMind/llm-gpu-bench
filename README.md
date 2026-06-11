@@ -211,9 +211,16 @@ measured kernel matches the uniform roofline. Real serving routing is imbalanced
 load-imbalance factor is future work.
 
 Accuracy on real expert configs (gpt-oss-20b: 32 experts top-4, H=I=2880; Qwen3-30B-A3B: 128
-experts top-8, H=2048 I=768) × M = 1…4096, `validate_predict.py --bench moe_bf16`:
+experts top-8, H=2048 I=768) × M = 1…4096:
 
-    latency error:  median 5.2%  mean 4.8%  p90 8.3%   (latency-weighted 4.6%, roofline-only 16%)
+    bf16  (4090) :  median 4.1%  mean 3.7%   (latency-weighted 2.9%, roofline-only 16%)
+    mxfp4 (GB200):  median 1.8%  latency-weighted 2.5%   (roofline-only 91% — 4-bit weights
+                    put the theoretical roofline far above achieved, so the grid does the work)
+
+For mxfp4, gpt-oss's 2880 dims are padded to 2944 (128-aligned) since Marlin can't tile
+non-128 dims — that's the shape production runs. The lone outlier is gpt-oss M=1 (~57%, single-
+token decode, 0.18 ms) — the steep low-efficiency corner that's the hard floor across every op
+and contributes nothing to real latency (hence the 2.5% latency-weighted error).
 
 The Triton path uses whatever config vLLM selects (default heuristic where no tuned JSON
 exists — exactly what serving runs); tuned-vs-untuned cancels in roofline ÷ efficiency, so no
@@ -248,7 +255,8 @@ Activate the env (torch + CUDA), then:
     python validate_predict.py --bench gemm_bf16                  # gemm accuracy
     python validate_predict.py --bench attn_bf16                  # attention accuracy
     python validate_predict.py --bench attn_mixed                 # mixed-step composition (t_pf+t_dec)
-    python validate_predict.py --bench moe_bf16                   # moe accuracy
+    python validate_predict.py --bench moe_bf16                   # moe accuracy (Triton bf16)
+    python validate_predict.py --bench moe_mxfp4                  # moe accuracy (Marlin mxfp4)
 
 The sweep needs torch + a CUDA GPU (mxfp4 needs vLLM/Marlin, attn needs FlashInfer);
 prediction does not. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is
@@ -265,5 +273,8 @@ memory-bound (B_peak only).
   (fa2/fa3/cutlass/trtllm-gen, skipping unsupported) — best-achievable efficiency, portable
   to Hopper/Blackwell. Because FlashInfer splits decode/prefill, continuous batching composes
   additively (mixed step = `t_prefill + t_decode`, ~1.8%).
-- Next: **mxfp4 MoE via Marlin** (like `marlin.py`); a **MoE load-imbalance factor** beyond
-  uniform routing; re-measure on Hopper/Blackwell to pick up `fa3`/`trtllm` kernels.
+- MoE has two schemes: **bf16 (Triton `fused_experts`)** and **mxfp4 w4a16 (Marlin
+  `fused_marlin_moe`)** — only the weight byte model differs. Both validated (~2–4%
+  latency-weighted); gpt-oss mxfp4 measured at 2944 (Marlin needs 128-aligned dims, as prod pads).
+- Next: a **MoE load-imbalance factor** beyond uniform routing; **best-of MoE backends**
+  (trtllm/flashinfer) for Blackwell; re-measure attention on Hopper to pick up `fa3`/`trtllm`.
