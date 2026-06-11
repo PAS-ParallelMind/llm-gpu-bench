@@ -237,7 +237,7 @@ the predictor reads `moe_bytes_model` from the JSON.
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
-    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<gpu>.json, moe[_mxfp4]_<gpu>.json
+    results/              gemm[_mxfp4]_<gpu>.json, attn_<gpu>.json, moe[_mxfp4]_<gpu>.json
 
 ## Run
 

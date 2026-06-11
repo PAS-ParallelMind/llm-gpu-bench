@@ -93,10 +93,11 @@ def _summary(pred_all, roof_all, meas_all=None) -> None:
 
 
 def validate_gemm(args, dtype: str) -> None:
-    glob = "marlin_mxfp4_*.json" if dtype == "mxfp4" else "gemm_*.json"
     recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [dtype], device=args.device,
                           iters=args.iters, warmup=args.warmup)
-    path = args.results or str(sorted(Path("results").glob(glob))[-1])
+    cands = sorted(Path("results").glob("gemm_*.json"))   # gemm_<gpu> (bf16/fp16) vs gemm_mxfp4_<gpu>
+    cands = [c for c in cands if ("mxfp4" in c.name) == (dtype == "mxfp4")]
+    path = args.results or str(cands[-1])
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   {dtype}   validating {len(MODEL_SHAPES)} real projections\n")

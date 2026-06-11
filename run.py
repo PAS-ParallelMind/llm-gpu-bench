@@ -121,7 +121,7 @@ def main() -> None:
         import vllm                                        # Marlin kernel ships in vLLM
         print("\n== gemm_mxfp4 (Marlin w4a16) ==")
         lib = {"vllm": vllm.__version__}
-        default_out = f"results/marlin_mxfp4_{props.name.replace(' ', '_')}.json"
+        default_out = f"results/gemm_mxfp4_{props.name.replace(' ', '_')}.json"
     else:
         print("\n== gemm (torch F.linear) ==")
         lib = {"torch": torch.__version__}                # the F.linear GEMM ships in torch
