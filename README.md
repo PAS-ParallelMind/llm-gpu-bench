@@ -235,13 +235,19 @@ the predictor reads `moe_bytes_model` from the JSON.
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
     moe.py                MoE sweep: Triton bf16 + Marlin mxfp4, two-grouped-GEMM roofline (torch+vLLM)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
+    run_all.sh            run every benchmark for one GPU (--c-peak/--b-peak)         (bash)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
     results/              gemm[_mxfp4]_<gpu>.json, attn_<gpu>.json, moe[_mxfp4]_<gpu>.json
 
 ## Run
 
-Activate the env (torch + CUDA), then:
+Activate the env (torch + CUDA), then run all benchmarks for a GPU at once:
+
+    ./run_all.sh --c-peak 165  --b-peak 1008                      # RTX 4090
+    ./run_all.sh --c-peak 2250 --b-peak 8000                      # GB200 / B200
+
+or one at a time:
 
     python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
     python run.py --bench gemm_mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 (Marlin)
