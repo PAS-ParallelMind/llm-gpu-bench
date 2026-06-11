@@ -89,9 +89,11 @@ def measure_moe_ms(M, E, top_k, H, I, *, quant="bf16", dtype="bf16",
                    device: int | torch.device = 0, iters=30, warmup=10) -> float:
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     fn, bufs = _moe_call(M, E, top_k, H, I, _DTYPES[dtype], dev, quant)
-    t = measure(fn, device=dev, iters=iters, warmup=warmup)
-    del fn, bufs
-    torch.cuda.empty_cache()
+    try:
+        t = measure(fn, device=dev, iters=iters, warmup=warmup)
+    finally:                                          # free weights even if the kernel rejects the shape
+        del fn, bufs
+        torch.cuda.empty_cache()
     return t.median_ms
 
 

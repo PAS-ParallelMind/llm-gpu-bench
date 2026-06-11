@@ -192,14 +192,22 @@ def validate_moe(args, quant: str) -> None:
     pred_all, roof_all, meas_all = [], [], []
     for name, (E, tk, H, I) in MOE_CONFIGS.items():
         for M in MOE_VAL_M:
-            meas = moe.measure_moe_ms(M, E, tk, H, I, quant=quant, device=args.device,
-                                      iters=args.iters, warmup=args.warmup)
+            try:
+                meas = moe.measure_moe_ms(M, E, tk, H, I, quant=quant, device=args.device,
+                                          iters=args.iters, warmup=args.warmup)
+            except Exception as e:          # Marlin rejects non-128-aligned dims (gpt-oss 2880);
+                print(f"  {name:8} {E:>4} {tk:>3} {H:>5} {I:>5} {M:>5} |    -     -  | "
+                      f"skip ({str(e).splitlines()[0][:34]})")   # production pads to marlin-friendly dims
+                continue
             ep = abs(pred.moe_latency_ms(M, E, tk, H, I) - meas) / meas
             er = abs(pred.moe_roofline_ms(M, E, tk, H, I) - meas) / meas
             pred_all.append(ep); roof_all.append(er); meas_all.append(meas)
             print(f"  {name:8} {E:>4} {tk:>3} {H:>5} {I:>5} {M:>5} | "
                   f"{ep*100:>4.0f}% {er*100:>4.0f}% | {meas:8.3f} ms")
-    _summary(pred_all, roof_all, meas_all)
+    if pred_all:
+        _summary(pred_all, roof_all, meas_all)
+    else:
+        print("\n  (no measurable cases — all configs rejected by the kernel)")
 
 
 def main() -> None:
