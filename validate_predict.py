@@ -187,17 +187,22 @@ def validate_moe(args, quant: str) -> None:
     path = args.results or str(cands[-1])
     pred = Predictor.from_json(path)
 
-    print(f"grid: {path}   MoE[{quant}]   {len(MOE_CONFIGS)} expert configs x {len(MOE_VAL_M)} token counts\n")
+    # mxfp4/Marlin needs 128-aligned dims; pad H,I up to 128 like production does (no-op for
+    # already-aligned configs, e.g. qwen). gpt-oss 2880 -> 2944, the shape that actually runs.
+    pad = (lambda x: -(-x // 128) * 128) if quant == "mxfp4" else (lambda x: x)
+    note = "  (mxfp4 H,I padded to 128 for Marlin)" if quant == "mxfp4" else ""
+    print(f"grid: {path}   MoE[{quant}]   {len(MOE_CONFIGS)} configs x {len(MOE_VAL_M)} M{note}\n")
     print(f"  {'config':8} {'E':>4} {'tk':>3} {'H':>5} {'I':>5} {'M':>5} | {'pred':>5} {'roof':>5} | {'meas':>9}")
     pred_all, roof_all, meas_all = [], [], []
-    for name, (E, tk, H, I) in MOE_CONFIGS.items():
+    for name, (E, tk, H0, I0) in MOE_CONFIGS.items():
+        H, I = pad(H0), pad(I0)
         for M in MOE_VAL_M:
             try:
                 meas = moe.measure_moe_ms(M, E, tk, H, I, quant=quant, device=args.device,
                                           iters=args.iters, warmup=args.warmup)
-            except Exception as e:          # Marlin rejects non-128-aligned dims (gpt-oss 2880);
+            except Exception as e:          # any residual unsupported shape -> skip, don't crash
                 print(f"  {name:8} {E:>4} {tk:>3} {H:>5} {I:>5} {M:>5} |    -     -  | "
-                      f"skip ({str(e).splitlines()[0][:34]})")   # production pads to marlin-friendly dims
+                      f"skip ({str(e).splitlines()[0][:34]})")
                 continue
             ep = abs(pred.moe_latency_ms(M, E, tk, H, I) - meas) / meas
             er = abs(pred.moe_roofline_ms(M, E, tk, H, I) - meas) / meas
