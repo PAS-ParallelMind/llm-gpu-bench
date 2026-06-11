@@ -12,13 +12,6 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
-# Python: $PYTHON if set, else the in-tree venv, else plain python. Make imports resolvable.
-PY="${PYTHON:-}"
-if [ -z "$PY" ]; then
-  [ -x ./vllm_env/bin/python ] && PY=./vllm_env/bin/python || PY=python
-fi
-export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
-
 CPEAK="" BPEAK="" PASS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,7 +33,7 @@ FAILED=()
 for b in "${BENCHES[@]}"; do
   echo
   echo "========================= $b ========================="
-  if "$PY" run.py --bench "$b" --c-peak "$CPEAK" --b-peak "$BPEAK" ${PASS[@]+"${PASS[@]}"}; then
+  if python3 run.py --bench "$b" --c-peak "$CPEAK" --b-peak "$BPEAK" ${PASS[@]+"${PASS[@]}"}; then
     :
   else
     echo "!! $b FAILED (continuing)" >&2
