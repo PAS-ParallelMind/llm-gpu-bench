@@ -86,6 +86,12 @@ class GemmRecord:
     predicted_ms: float = 0.0   # roofline w/ measured peaks (filled in later)
     residual: float = 0.0       # median / predicted (1.0 == roofline is tight)
 
+    def result(self) -> dict:
+        eff = (self.predicted_ms / self.median_ms) if self.median_ms > 0 else 0.0  # roofline/measured
+        return {"shape": {"M": self.M, "K": self.K, "N": self.N},
+                "latency_ms": self.median_ms, "tflops": self.tflops, "gbps": self.gbps,
+                "efficiency": eff}
+
 
 def gemm_bytes(dtype: str, M: int, K: int, N: int) -> float:
     bm = BYTES_MODEL[dtype]

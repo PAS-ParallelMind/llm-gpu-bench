@@ -188,7 +188,15 @@ class DecodeRecord:
     dtype: str
     median_ms: float
     backend: str            # winning FlashInfer kernel
+    tflops: float = 0.0     # achieved compute throughput
+    gbps: float = 0.0       # achieved memory throughput
     efficiency: float = 0.0
+
+    def result(self) -> dict:
+        return {"shape": {"kind": "decode", "kv_tokens": self.kv_tokens, "H_kv": self.H_kv,
+                          "D": self.D, "backend": self.backend},
+                "latency_ms": self.median_ms, "tflops": self.tflops, "gbps": self.gbps,
+                "efficiency": self.efficiency}
 
 
 @dataclass
@@ -201,7 +209,15 @@ class AttnRecord:
     median_ms: float
     regime: str             # "C" compute-bound, "M" memory-bound
     backend: str            # winning FlashInfer kernel
+    tflops: float = 0.0     # achieved compute throughput
+    gbps: float = 0.0       # achieved memory throughput
     efficiency: float = 0.0
+
+    def result(self) -> dict:
+        return {"shape": {"kind": "prefill", "Sq": self.Sq, "Sk": self.Sk, "RH": self.RH,
+                          "D": self.D, "backend": self.backend},
+                "latency_ms": self.median_ms, "tflops": self.tflops, "gbps": self.gbps,
+                "efficiency": self.efficiency}
 
 
 def measure_attn_ms(R, Sq, Sk, H, H_kv, D, *, dtype="bf16",
@@ -269,9 +285,13 @@ def run_decode_sweep(Ls, Rs, *, b_peak, H=32, H_kv=8, D=128, dtype="bf16",
                 torch.cuda.empty_cache()
                 continue
             nbytes = kv_bytes(R * L, H_kv, D, elem)
+            flops = attn_flops(R, 1, L, H, D)
             sec = ms * 1e-3
             recs.append(DecodeRecord(kv_tokens=R * L, H_kv=H_kv, D=D, dtype=dtype, median_ms=ms,
-                        backend=_name(cand), efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
+                        backend=_name(cand),
+                        tflops=flops / sec / 1e12 if sec > 0 else 0.0,
+                        gbps=nbytes / sec / 1e9 if sec > 0 else 0.0,
+                        efficiency=(nbytes / B / sec) if sec > 0 else 0.0))
             pbar.set_postfix_str(f"R={R} L={L} [{_name(cand)}]")
             pbar.update(1)
             del fn, bufs
@@ -300,11 +320,14 @@ def run_attn_sweep(Sqs, Sks, RHs, *, D, c_peak, b_peak, H=32, H_kv=8, dtype="bf1
             pbar.update(1)
             torch.cuda.empty_cache()
             continue
-        tc = attn_flops(R, sq, sk, H, D) / C
-        tm = attn_bytes(R, sq, sk, H, H_kv, D, elem) / B
+        flops = attn_flops(R, sq, sk, H, D)
+        nbytes = attn_bytes(R, sq, sk, H, H_kv, D, elem)
+        tc, tm = flops / C, nbytes / B
         sec = ms * 1e-3
         recs.append(AttnRecord(Sq=sq, Sk=sk, RH=R * H, D=D, dtype=dtype, median_ms=ms,
                     regime="C" if tc > tm else "M", backend=_name(cand),
+                    tflops=flops / sec / 1e12 if sec > 0 else 0.0,
+                    gbps=nbytes / sec / 1e9 if sec > 0 else 0.0,
                     efficiency=(max(tc, tm) / sec) if sec > 0 else 0.0))
         pbar.set_postfix_str(f"Sq={sq} Sk={sk} RH={R*H} [{_name(cand)}]")
         pbar.update(1)

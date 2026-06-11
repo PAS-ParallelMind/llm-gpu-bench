@@ -107,7 +107,14 @@ class MoERecord:
     quant: str              # "bf16" or "mxfp4" (weight scheme)
     median_ms: float
     regime: str             # "C" compute-bound, "M" memory-bound (weight-read)
+    tflops: float = 0.0     # achieved compute throughput
+    gbps: float = 0.0       # achieved memory throughput
     efficiency: float = 0.0
+
+    def result(self) -> dict:
+        return {"shape": {"M": self.M, "E": self.E, "top_k": self.top_k, "H": self.H, "I": self.I},
+                "latency_ms": self.median_ms, "tflops": self.tflops, "gbps": self.gbps,
+                "efficiency": self.efficiency}
 
 
 def run_moe_sweep(Ms, Es, Hs, Is, top_k, *, c_peak, b_peak, quant="bf16", dtype="bf16",
@@ -127,11 +134,14 @@ def run_moe_sweep(Ms, Es, Hs, Is, top_k, *, c_peak, b_peak, quant="bf16", dtype=
             print(f"  [skip pt] moe[{quant}] M={M} E={E} H={H} I={I}: {str(e).splitlines()[0][:50]}")
             pbar.update(1)
             continue
-        tc = moe_flops(M, top_k, H, I) / C
-        tm = moe_bytes(M, E, top_k, H, I, quant) / B
+        flops = moe_flops(M, top_k, H, I)
+        nbytes = moe_bytes(M, E, top_k, H, I, quant)
+        tc, tm = flops / C, nbytes / B
         sec = ms * 1e-3
         recs.append(MoERecord(M=M, E=E, top_k=top_k, H=H, I=I, quant=quant, median_ms=ms,
                     regime="C" if tc > tm else "M",
+                    tflops=flops / sec / 1e12 if sec > 0 else 0.0,
+                    gbps=nbytes / sec / 1e9 if sec > 0 else 0.0,
                     efficiency=(max(tc, tm) / sec) if sec > 0 else 0.0))
         pbar.set_postfix_str(f"M={M} E={E} H={H} I={I}")
         pbar.update(1)

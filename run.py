@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict
 from pathlib import Path
 
 import torch
@@ -28,35 +27,35 @@ import torch
 from gemm import BYTES_MODEL, DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
+def _dump(out, gpu, c_peak, b_peak, bench, impl, bytes_model, results) -> None:
+    """Write the unified result JSON: hardware / operation / per-case results."""
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "hardware": {"gpu": gpu, "c_peak_tflops": c_peak, "b_peak_gbps": b_peak},
+        "operation": {"bench": bench, "impl": impl, "bytes_model": bytes_model},
+        "results": results,
+    }, indent=2))
+    print(f"\nwrote {out}")
+
+
 def _run_attn(args, props, dtype: str) -> None:
     """Flash-attention (FlashInfer, best of kernels): decode KV-byte curve + prefill grid."""
     import flashinfer
-    from attn import DECODE_CANDIDATES, PREFILL_CANDIDATES, run_full_attn_sweep
+    from attn import run_full_attn_sweep
     print("\n== attn (FlashInfer, paged KV, best of backends) ==")
     decode, grid = run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
                                        device=args.device, iters=args.iters, warmup=args.warmup)
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
-    print(f"  decode curve {len(decode)} pts ({decode[0].efficiency:.2f}..{decode[-1].efficiency:.2f})"
-          f"   prefill grid {len(grid)} pts")
-    won = {}
+    print(f"  decode curve {len(decode)} pts   prefill grid {len(grid)} pts")
+    won: dict[str, int] = {}
     for r in decode + grid:
         won[r.backend] = won.get(r.backend, 0) + 1
-    print(f"  winning kernels: " + ", ".join(f"{k}×{v}" for k, v in sorted(won.items())))
-    out = Path(args.out or f"results/attn_{props.name.replace(' ', '_')}.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({
-        "gpu": props.name,
-        "lib": {"flashinfer": flashinfer.__version__},
-        "op": "attn",
-        "backend": "flashinfer",
-        "candidates": {"decode": [str(c) for c in DECODE_CANDIDATES],
-                       "prefill": PREFILL_CANDIDATES},
-        "c_peak_tflops": args.c_peak,
-        "b_peak_gbps": args.b_peak,
-        "decode": [asdict(r) for r in decode],
-        "grid": [asdict(r) for r in grid],
-    }, indent=2))
-    print(f"\nwrote {out}")
+    print("  winning kernels: " + ", ".join(f"{k}×{v}" for k, v in sorted(won.items())))
+    results = [r.result() for r in decode] + [r.result() for r in grid]
+    out = args.out or f"results/attn_{props.name.replace(' ', '_')}.json"
+    _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
+          {"flashinfer": flashinfer.__version__}, {"elem": 2}, results)
 
 
 def _run_moe(args, props, dtype: str) -> None:
@@ -73,19 +72,10 @@ def _run_moe(args, props, dtype: str) -> None:
     print(f"  {len(recs)} points; efficiency "
           f"{min(r.efficiency for r in recs):.2f} .. {max(r.efficiency for r in recs):.2f}")
     suffix = "" if quant == "bf16" else f"{quant}_"
-    out = Path(args.out or f"results/moe_{suffix}{props.name.replace(' ', '_')}.json")
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({
-        "gpu": props.name,
-        "lib": {"vllm": vllm.__version__},
-        "op": "moe",
-        "quant": quant,
-        "c_peak_tflops": args.c_peak,
-        "b_peak_gbps": args.b_peak,
-        "moe_bytes_model": {"w": WEIGHT_BYTES[quant], "a": 2.0},
-        "moe": [asdict(r) for r in recs],
-    }, indent=2))
-    print(f"\nwrote {out}")
+    out = args.out or f"results/moe_{suffix}{props.name.replace(' ', '_')}.json"
+    _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
+          {"vllm": vllm.__version__}, {"w": WEIGHT_BYTES[quant], "a": 2.0},
+          [r.result() for r in recs])
 
 
 def main() -> None:
@@ -139,7 +129,6 @@ def main() -> None:
     recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
                           device=dev, iters=args.iters, warmup=args.warmup)
     roofline_residual(recs, {dtype: (c_peak, "input")}, b_peak)
-    c_peaks, bytes_model = {dtype: c_peak}, BYTES_MODEL[dtype]
 
     achieved_c = max(r.tflops for r in recs)
     achieved_b = max(r.gbps for r in recs)
@@ -153,20 +142,8 @@ def main() -> None:
         print(f"    {r.dtype} {r.shape:16} M={r.M:<5} "
               f"resid {r.residual:4.1f}x  ({r.median_ms:.3f} ms vs {r.predicted_ms:.3f})")
 
-    out = Path(args.out or default_out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps({
-        "gpu": props.name,
-        "lib": lib,
-        "bench": args.bench,
-        "op": op,
-        "b_peak_gbps": b_peak,
-        "c_peak": c_peaks,
-        "achieved": {"c_tflops": round(achieved_c, 1), "b_gbps": round(achieved_b, 1)},
-        "bytes_model": bytes_model,
-        "gemm": [asdict(r) for r in recs],
-    }, indent=2))
-    print(f"\nwrote {out}")
+    _dump(args.out or default_out, props.name, c_peak, b_peak, args.bench,
+          lib, BYTES_MODEL[dtype], [r.result() for r in recs])
 
 
 if __name__ == "__main__":

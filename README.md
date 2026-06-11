@@ -261,6 +261,28 @@ The sweep needs torch + a CUDA GPU (mxfp4 needs vLLM/Marlin, attn needs FlashInf
 prediction does not. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is
 memory-bound (B_peak only).
 
+## Output format
+
+Every benchmark writes the **same JSON schema** (`run.py`'s `_dump`; `predict.py` reads it,
+and still loads pre-unification files):
+
+    {
+      "hardware":  { "gpu", "c_peak_tflops", "b_peak_gbps" },
+      "operation": { "bench",                 # e.g. "gemm_bf16", "attn_bf16", "moe_mxfp4"
+                     "impl",                   # {"torch"/"vllm"/"flashinfer": version}
+                     "bytes_model" },          # {"w","a","o"} (gemm/moe) or {"elem"} (attn)
+      "results": [ { "shape":      { … op-specific input dims … },
+                     "latency_ms",             # average latency
+                     "tflops",                 # achieved compute throughput
+                     "gbps",                   # achieved memory throughput
+                     "efficiency" }, … ]       # roofline / measured
+    }
+
+`shape` carries each op's input dimensions: gemm `{M,K,N}`; moe `{M,E,top_k,H,I}`; attention
+`{kind:"decode", kv_tokens,H_kv,D}` or `{kind:"prefill", Sq,Sk,RH,D}` (one `results` list holds
+both). The efficiency factor is what the predictor interpolates; tflops/gbps/latency are the
+measured throughputs for inspection.
+
 ## Scope / next
 
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only

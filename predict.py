@@ -62,7 +62,44 @@ class Predictor:
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
+        """Build a predictor from a results JSON. Reads the unified schema
+        (hardware / operation / results); falls back to the legacy per-op schema."""
         d = json.loads(Path(path).read_text())
+        if "hardware" not in d:
+            return cls._from_legacy(d)
+        hw, opn = d["hardware"], d["operation"]
+        b_peak, c_peak = float(hw["b_peak_gbps"]), float(hw["c_peak_tflops"])
+        op, _, dtype = opn["bench"].partition("_")          # gemm/attn/moe ; bf16/fp16/mxfp4
+        results = d["results"]
+
+        def sh(r):
+            return r["shape"]
+
+        if op == "attn":
+            dec = [r for r in results if sh(r).get("kind") == "decode"]
+            pre = [r for r in results if sh(r).get("kind") == "prefill"]
+            dcurve = sorted((math.log(_kv_bytes(sh(r)["kv_tokens"], sh(r)["H_kv"], sh(r)["D"])),
+                             r["efficiency"]) for r in dec)
+            geff = {(sh(r)["Sq"], sh(r)["Sk"], sh(r)["RH"], sh(r)["D"]): r["efficiency"] for r in pre}
+            gaxes = tuple(sorted({k[i] for k in geff}) for i in range(4))
+            return cls(b_peak=b_peak, op="attn", attn_c=c_peak, attn_eff=geff, attn_axes=gaxes,
+                       attn_decode_curve=dcurve, attn_backend=next(iter(opn.get("impl", {})), "flashinfer"))
+        if op == "moe":
+            meff = {(sh(r)["M"] * sh(r)["top_k"], sh(r)["E"], sh(r)["H"], sh(r)["I"]): r["efficiency"]
+                    for r in results}
+            maxes = tuple(sorted({k[i] for k in meff}) for i in range(4))   # (Ts, Es, Hs, Is)
+            return cls(b_peak=b_peak, op="moe", moe_c=c_peak, moe_eff=meff, moe_axes=maxes,
+                       moe_bytes_model=opn.get("bytes_model", {"w": 2.0, "a": 2.0}))
+        eff = {dtype: {(sh(r)["M"], sh(r)["K"], sh(r)["N"]):
+                       (r["efficiency"] if r["efficiency"] else float("nan")) for r in results}}
+        axes = {dt: (sorted({k[0] for k in t}), sorted({k[1] for k in t}), sorted({k[2] for k in t}))
+                for dt, t in eff.items()}
+        return cls(b_peak=b_peak, op="gemm", c_peak={dtype: c_peak}, axes=axes, eff=eff,
+                   bytes_model=opn.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0}))
+
+    @classmethod
+    def _from_legacy(cls, d: dict) -> "Predictor":
+        """Reader for the pre-unification per-op JSON schema (so old result files still load)."""
         op = d.get("op", "gemm")
         b_peak = float(d["b_peak_gbps"])
         if op == "attn":
@@ -75,12 +112,11 @@ class Predictor:
                        attn_backend=d.get("backend", "flashinfer"))
         if op == "moe":
             meff = {(r["M"] * r["top_k"], r["E"], r["H"], r["I"]): r["efficiency"] for r in d["moe"]}
-            maxes = tuple(sorted({k[i] for k in meff}) for i in range(4))   # (Ts, Es, Hs, Is)
+            maxes = tuple(sorted({k[i] for k in meff}) for i in range(4))
             return cls(b_peak=b_peak, op="moe", moe_c=float(d["c_peak_tflops"]),
                        moe_eff=meff, moe_axes=maxes,
                        moe_bytes_model=d.get("moe_bytes_model", {"w": 2.0, "a": 2.0}))
         c_peak = {k: float(v) for k, v in d["c_peak"].items()}
-        # bf16/fp16 read & write 2 bytes/elem; quant schemes override via the JSON.
         bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0})
         eff: dict = {}
         for r in d["gemm"]:
