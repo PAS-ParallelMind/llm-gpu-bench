@@ -60,23 +60,29 @@ def _run_attn(args, props, dtype: str) -> None:
 
 
 def _run_moe(args, props, dtype: str) -> None:
-    """MoE: vLLM fused_experts (Triton) swept over (M, E, H, I); two-grouped-GEMM roofline."""
+    """MoE: token-routed grouped GEMM, two-grouped-GEMM roofline. dtype selects the scheme:
+    bf16 -> fused_experts (Triton); mxfp4 -> fused_marlin_moe (w4a16 Marlin)."""
     import vllm
-    from moe import run_full_moe_sweep
-    print("\n== moe (vLLM fused_experts, Triton, token-routed grouped GEMM) ==")
-    recs = run_full_moe_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
+    from moe import WEIGHT_BYTES, run_full_moe_sweep
+    quant = dtype                                      # "bf16" or "mxfp4"
+    label = {"bf16": "fused_experts Triton", "mxfp4": "fused_marlin_moe w4a16"}[quant]
+    print(f"\n== moe[{quant}] (vLLM {label}, token-routed grouped GEMM) ==")
+    recs = run_full_moe_sweep(c_peak=args.c_peak, b_peak=args.b_peak, quant=quant, dtype="bf16",
                               device=args.device, iters=args.iters, warmup=args.warmup)
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
     print(f"  {len(recs)} points; efficiency "
           f"{min(r.efficiency for r in recs):.2f} .. {max(r.efficiency for r in recs):.2f}")
-    out = Path(args.out or f"results/moe_{props.name.replace(' ', '_')}.json")
+    suffix = "" if quant == "bf16" else f"{quant}_"
+    out = Path(args.out or f"results/moe_{suffix}{props.name.replace(' ', '_')}.json")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "gpu": props.name,
         "lib": {"vllm": vllm.__version__},
         "op": "moe",
+        "quant": quant,
         "c_peak_tflops": args.c_peak,
         "b_peak_gbps": args.b_peak,
+        "moe_bytes_model": {"w": WEIGHT_BYTES[quant], "a": 2.0},
         "moe": [asdict(r) for r in recs],
     }, indent=2))
     print(f"\nwrote {out}")
@@ -85,7 +91,7 @@ def _run_moe(args, props, dtype: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "moe_bf16"],
+                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "moe_bf16", "moe_mxfp4"],
                     help="which benchmark to run (<op>_<dtype>).")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,

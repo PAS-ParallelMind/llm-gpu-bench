@@ -180,17 +180,19 @@ def validate_mixed(args) -> None:
           f"median {np.median(es)*100:.1f}%  max {es.max()*100:.1f}%")
 
 
-def validate_moe(args) -> None:
+def validate_moe(args, quant: str) -> None:
     import moe
-    path = args.results or str(sorted(Path("results").glob("moe_*.json"))[-1])
+    cands = sorted(Path("results").glob("moe_*.json"))
+    cands = [c for c in cands if ("mxfp4" in c.name) == (quant == "mxfp4")]
+    path = args.results or str(cands[-1])
     pred = Predictor.from_json(path)
 
-    print(f"grid: {path}   MoE   {len(MOE_CONFIGS)} expert configs x {len(MOE_VAL_M)} token counts\n")
+    print(f"grid: {path}   MoE[{quant}]   {len(MOE_CONFIGS)} expert configs x {len(MOE_VAL_M)} token counts\n")
     print(f"  {'config':8} {'E':>4} {'tk':>3} {'H':>5} {'I':>5} {'M':>5} | {'pred':>5} {'roof':>5} | {'meas':>9}")
     pred_all, roof_all, meas_all = [], [], []
     for name, (E, tk, H, I) in MOE_CONFIGS.items():
         for M in MOE_VAL_M:
-            meas = moe.measure_moe_ms(M, E, tk, H, I, device=args.device,
+            meas = moe.measure_moe_ms(M, E, tk, H, I, quant=quant, device=args.device,
                                       iters=args.iters, warmup=args.warmup)
             ep = abs(pred.moe_latency_ms(M, E, tk, H, I) - meas) / meas
             er = abs(pred.moe_roofline_ms(M, E, tk, H, I) - meas) / meas
@@ -203,7 +205,8 @@ def validate_moe(args) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed", "moe_bf16"])
+                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed",
+                             "moe_bf16", "moe_mxfp4"])
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--iters", type=int, default=50)
@@ -216,7 +219,7 @@ def main() -> None:
     elif op == "attn":
         validate_attn(args)
     elif op == "moe":
-        validate_moe(args)
+        validate_moe(args, dtype)
     else:
         validate_gemm(args, dtype)
 

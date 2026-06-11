@@ -182,13 +182,16 @@ the prefill path (e.g. vLLM's FlashAttention/FA2 on Ada, where `num_splits>1` is
 loses decode's split-KV — it is **1.1–5.8× slower on mixed steps and not composable** (sum
 mispredicts by ~50%). That is the concrete reason FlashInfer is the targeted backend here.
 
-## MoE (vLLM fused_experts, Triton)
+## MoE (vLLM — Triton bf16 + Marlin mxfp4)
 
 A fourth op. A fused-MoE layer routes each of M tokens to top_k of E experts, then runs two
 grouped GEMMs per expert: gate+up (`H→2I`), SiLU, down (`I→H`). We **model it as those two
-grouped GEMMs under uniform routing** (the analytic roofline) but **measure the real
-`fused_experts` kernel**, so fusion + routing land in the efficiency factor — same roofline ÷
-efficiency split as the other ops.
+grouped GEMMs under uniform routing** (the analytic roofline) but **measure the real kernel**,
+so fusion + routing land in the efficiency factor — same roofline ÷ efficiency split as the
+other ops. Two schemes (`--bench moe_bf16` / `moe_mxfp4`) differing only in the weight byte
+model — `fused_experts` (Triton, bf16, 2 B/elem) and `fused_marlin_moe` (w4a16 Marlin, mxfp4
+4-bit + E8M0 scale ≈ 0.53 B/elem; FLOPs identical since Marlin dequants to bf16 tensor cores),
+exactly the bf16↔mxfp4 relationship `gemm.py`↔`marlin.py` has.
 
     routed tokens  T = M·top_k ;  active experts E_act = min(E, T) ;  per-expert tokens T/E_act
     FLOPs = 6·T·H·I  (gate+up 4·T·H·I + down 2·T·H·I)
@@ -214,7 +217,9 @@ experts top-8, H=2048 I=768) × M = 1…4096, `validate_predict.py --bench moe_b
 
 The Triton path uses whatever config vLLM selects (default heuristic where no tuned JSON
 exists — exactly what serving runs); tuned-vs-untuned cancels in roofline ÷ efficiency, so no
-autotuning is needed. mxfp4 MoE via Marlin is the planned next variant (like `marlin.py`).
+autotuning is needed. The **mxfp4 (Marlin)** scheme reuses the same grid/roofline with the
+weight byte model swapped (per-expert mxfp4 Marlin weights via `marlin.make_mxfp4_weight`);
+the predictor reads `moe_bytes_model` from the JSON.
 
 ## Files
 
@@ -222,11 +227,11 @@ autotuning is needed. mxfp4 MoE via Marlin is the planned next variant (like `ma
     gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
     marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
-    moe.py                MoE sweep: fused_experts (Triton), two-grouped-GEMM roofline (torch+vLLM)
+    moe.py                MoE sweep: Triton bf16 + Marlin mxfp4, two-grouped-GEMM roofline (torch+vLLM)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
-    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<gpu>.json, moe_<gpu>.json
+    results/              gemm_<gpu>.json, marlin_mxfp4_<gpu>.json, attn_<gpu>.json, moe[_mxfp4]_<gpu>.json
 
 ## Run
 
@@ -235,7 +240,8 @@ Activate the env (torch + CUDA), then:
     python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
     python run.py --bench gemm_mxfp4 --c-peak 165 --b-peak 1008   # mxfp4 w4a16 (Marlin)
     python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008   # FlashInfer attn (best of kernels)
-    python run.py --bench moe_bf16   --c-peak 165 --b-peak 1008   # MoE fused_experts (Triton)
+    python run.py --bench moe_bf16   --c-peak 165 --b-peak 1008   # MoE fused_experts (Triton bf16)
+    python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (Marlin mxfp4)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
     python predict.py --results results/attn_*.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
     python predict.py --results results/moe_*.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
@@ -253,8 +259,8 @@ memory-bound (B_peak only).
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
 - Done: **bf16 GEMM** + **mxfp4 w4a16 (Marlin)** + **flash-attention (FlashInfer, hybrid:
-  decode KV-byte curve + prefill grid)** + **fused MoE (Triton, two-grouped-GEMM)** —
-  benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`.
+  decode KV-byte curve + prefill grid)** + **fused MoE (Triton bf16 + Marlin mxfp4,
+  two-grouped-GEMM)** — benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`.
 - Attention targets **FlashInfer** and per shape keeps the **best of its kernels**
   (fa2/fa3/cutlass/trtllm-gen, skipping unsupported) — best-achievable efficiency, portable
   to Hopper/Blackwell. Because FlashInfer splits decode/prefill, continuous batching composes

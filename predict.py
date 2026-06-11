@@ -58,6 +58,7 @@ class Predictor:
     moe_c: float = 0.0                                           # TFLOP/s (moe compute ceiling)
     moe_eff: dict = field(default_factory=dict)                  # {(T,E,H,I): eff}  T=M*top_k
     moe_axes: tuple = field(default_factory=tuple)               # (Ts, Es, Hs, Is)
+    moe_bytes_model: dict[str, float] = field(default_factory=lambda: {"w": 2.0, "a": 2.0})
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
@@ -76,7 +77,8 @@ class Predictor:
             meff = {(r["M"] * r["top_k"], r["E"], r["H"], r["I"]): r["efficiency"] for r in d["moe"]}
             maxes = tuple(sorted({k[i] for k in meff}) for i in range(4))   # (Ts, Es, Hs, Is)
             return cls(b_peak=b_peak, op="moe", moe_c=float(d["c_peak_tflops"]),
-                       moe_eff=meff, moe_axes=maxes)
+                       moe_eff=meff, moe_axes=maxes,
+                       moe_bytes_model=d.get("moe_bytes_model", {"w": 2.0, "a": 2.0}))
         c_peak = {k: float(v) for k, v in d["c_peak"].items()}
         # bf16/fp16 read & write 2 bytes/elem; quant schemes override via the JSON.
         bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0})
@@ -169,11 +171,12 @@ class Predictor:
         return self.attn_roofline_ms(R, Sq, Sk, H, H_kv, D) / self.attn_efficiency(R, Sq, Sk, H, H_kv, D)
 
     # --- MoE: two grouped GEMMs (uniform routing); efficiency over (log T, log E, log H, log I) ---
-    def moe_roofline_ms(self, M, E, top_k, H, I, elem=2):
+    def moe_roofline_ms(self, M, E, top_k, H, I):
+        bm = self.moe_bytes_model                      # {"w": weight B/elem, "a": act B/elem}
         T = M * top_k
         E_act = min(E, T)                              # only top_k experts fire at small M
         flops = 6 * T * H * I                          # gate+up (4THI) + down (2THI)
-        nbytes = E_act * 3 * H * I * elem + 2 * M * H * elem
+        nbytes = E_act * 3 * H * I * bm["w"] + 2 * M * H * bm["a"]
         return max(flops / (self.moe_c * 1e12), nbytes / (self.b_peak * 1e9)) * 1e3
 
     def moe_efficiency(self, M, E, top_k, H, I):
