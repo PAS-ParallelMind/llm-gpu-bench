@@ -93,15 +93,9 @@ def _summary(pred_all, roof_all, meas_all=None) -> None:
 
 
 def validate_gemm(args, dtype: str) -> None:
-    if dtype == "mxfp4":
-        from marlin import run_marlin_sweep
-        glob = "marlin_mxfp4_*.json"
-        recs = run_marlin_sweep(MODEL_SHAPES, VAL_MS, device=args.device,
-                                iters=args.iters, warmup=args.warmup)
-    else:
-        glob = "gemm_*.json"
-        recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [dtype], device=args.device,
-                              iters=args.iters, warmup=args.warmup)
+    glob = "marlin_mxfp4_*.json" if dtype == "mxfp4" else "gemm_*.json"
+    recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [dtype], device=args.device,
+                          iters=args.iters, warmup=args.warmup)
     path = args.results or str(sorted(Path("results").glob(glob))[-1])
     pred = Predictor.from_json(path)
 

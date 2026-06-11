@@ -25,7 +25,7 @@ from pathlib import Path
 
 import torch
 
-from gemm import DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
+from gemm import BYTES_MODEL, DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
 def _run_attn(args, props, dtype: str) -> None:
@@ -128,24 +128,18 @@ def main() -> None:
     c_peak, b_peak = args.c_peak, args.b_peak
 
     if dtype == "mxfp4":
-        # mxfp4 w4a16 via vLLM Marlin (imported lazily — pulls in vLLM).
-        import vllm
-        from marlin import BYTES_MODEL, marlin_roofline_residual, run_marlin_sweep
+        import vllm                                        # Marlin kernel ships in vLLM
         print("\n== gemm_mxfp4 (Marlin w4a16) ==")
-        recs = run_marlin_sweep(shapes, DEFAULT_MS,
-                                device=dev, iters=args.iters, warmup=args.warmup)
-        marlin_roofline_residual(recs, c_peak, b_peak)
-        c_peaks, bytes_model = {"mxfp4": c_peak}, BYTES_MODEL
-        lib = {"vllm": vllm.__version__}                  # the Marlin kernel ships in vLLM
+        lib = {"vllm": vllm.__version__}
         default_out = f"results/marlin_mxfp4_{props.name.replace(' ', '_')}.json"
     else:
         print("\n== gemm (torch F.linear) ==")
-        recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
-                              device=dev, iters=args.iters, warmup=args.warmup)
-        roofline_residual(recs, {dtype: (c_peak, "input")}, b_peak)
-        c_peaks, bytes_model = {dtype: c_peak}, {"w": 2.0, "a": 2.0, "o": 2.0}
         lib = {"torch": torch.__version__}                # the F.linear GEMM ships in torch
         default_out = f"results/gemm_{props.name.replace(' ', '_')}.json"
+    recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
+                          device=dev, iters=args.iters, warmup=args.warmup)
+    roofline_residual(recs, {dtype: (c_peak, "input")}, b_peak)
+    c_peaks, bytes_model = {dtype: c_peak}, BYTES_MODEL[dtype]
 
     achieved_c = max(r.tflops for r in recs)
     achieved_b = max(r.gbps for r in recs)

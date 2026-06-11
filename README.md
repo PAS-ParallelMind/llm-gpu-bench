@@ -191,7 +191,7 @@ so fusion + routing land in the efficiency factor — same roofline ÷ efficienc
 other ops. Two schemes (`--bench moe_bf16` / `moe_mxfp4`) differing only in the weight byte
 model — `fused_experts` (Triton, bf16, 2 B/elem) and `fused_marlin_moe` (w4a16 Marlin, mxfp4
 4-bit + E8M0 scale ≈ 0.53 B/elem; FLOPs identical since Marlin dequants to bf16 tensor cores),
-exactly the bf16↔mxfp4 relationship `gemm.py`↔`marlin.py` has.
+exactly the bf16↔mxfp4 relationship `gemm.py` itself has (both schemes in one file).
 
     routed tokens  T = M·top_k ;  active experts E_act = min(E, T) ;  per-expert tokens T/E_act
     FLOPs = 6·T·H·I  (gate+up 4·T·H·I + down 2·T·H·I)
@@ -231,8 +231,7 @@ the predictor reads `moe_bytes_model` from the JSON.
 ## Files
 
     timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
-    gemm.py               GEMM sweep, model-agnostic grid, roofline       (torch)
-    marlin.py             mxfp4 w4a16 sweep via vLLM Marlin + byte model (torch+vLLM)
+    gemm.py               GEMM sweep (bf16/fp16 F.linear + mxfp4 Marlin), grid, roofline (torch[+vLLM])
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
     moe.py                MoE sweep: Triton bf16 + Marlin mxfp4, two-grouped-GEMM roofline (torch+vLLM)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
