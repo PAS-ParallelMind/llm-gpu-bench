@@ -238,7 +238,7 @@ the predictor reads `moe_bytes_model` from the JSON.
     run_all.sh            run every benchmark for one GPU (--c-peak/--b-peak)         (bash)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM) (stdlib)
     validate_predict.py   predicted vs measured on real workloads         (torch)
-    results/              gemm[_mxfp4]_<gpu>.json, attn_<gpu>.json, moe[_mxfp4]_<gpu>.json
+    results/              <op>_<dtype>.json — gemm_bf16, gemm_mxfp4, attn_bf16, moe_bf16, moe_mxfp4
 
 ## Run
 
@@ -255,8 +255,8 @@ or one at a time:
     python run.py --bench moe_bf16   --c-peak 165 --b-peak 1008   # MoE fused_experts (Triton bf16)
     python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (Marlin mxfp4)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
-    python predict.py --results results/attn_*.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
-    python predict.py --results results/moe_*.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
+    python predict.py --results results/attn_bf16.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
+    python predict.py --results results/moe_bf16.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
     python validate_predict.py --bench gemm_bf16                  # gemm accuracy
     python validate_predict.py --bench attn_bf16                  # attention accuracy
     python validate_predict.py --bench attn_mixed                 # mixed-step composition (t_pf+t_dec)

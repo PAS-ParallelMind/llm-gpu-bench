@@ -53,7 +53,7 @@ def _run_attn(args, props, dtype: str) -> None:
         won[r.backend] = won.get(r.backend, 0) + 1
     print("  winning kernels: " + ", ".join(f"{k}×{v}" for k, v in sorted(won.items())))
     results = [r.result() for r in decode] + [r.result() for r in grid]
-    out = args.out or f"results/attn_{props.name.replace(' ', '_')}.json"
+    out = args.out or f"results/{args.bench}.json"
     _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
           {"flashinfer": flashinfer.__version__}, {"elem": 2}, results)
 
@@ -71,8 +71,7 @@ def _run_moe(args, props, dtype: str) -> None:
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
     print(f"  {len(recs)} points; efficiency "
           f"{min(r.efficiency for r in recs):.2f} .. {max(r.efficiency for r in recs):.2f}")
-    suffix = "" if quant == "bf16" else f"{quant}_"
-    out = args.out or f"results/moe_{suffix}{props.name.replace(' ', '_')}.json"
+    out = args.out or f"results/{args.bench}.json"
     _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
           {"vllm": vllm.__version__}, {"w": WEIGHT_BYTES[quant], "a": 2.0},
           [r.result() for r in recs])
@@ -121,11 +120,10 @@ def main() -> None:
         import vllm                                        # Marlin kernel ships in vLLM
         print("\n== gemm_mxfp4 (Marlin w4a16) ==")
         lib = {"vllm": vllm.__version__}
-        default_out = f"results/gemm_mxfp4_{props.name.replace(' ', '_')}.json"
     else:
         print("\n== gemm (torch F.linear) ==")
         lib = {"torch": torch.__version__}                # the F.linear GEMM ships in torch
-        default_out = f"results/gemm_{props.name.replace(' ', '_')}.json"
+    default_out = f"results/{args.bench}.json"
     recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
                           device=dev, iters=args.iters, warmup=args.warmup)
     roofline_residual(recs, {dtype: (c_peak, "input")}, b_peak)

@@ -238,7 +238,7 @@ class Predictor:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--results", default=None,
-                    help="results JSON (default: newest results/gemm_*.json)")
+                    help="results JSON (default: results/gemm_bf16.json)")
     ap.add_argument("--dtype", default="bf16")
     # gemm
     ap.add_argument("--shape", nargs=2, type=int, metavar=("K", "N"), default=None)
@@ -250,12 +250,9 @@ def main() -> None:
     ap.add_argument("--moe", nargs=4, type=int, metavar=("E", "top_k", "H", "I"), default=None)
     args = ap.parse_args()
 
-    path = args.results
-    if path is None:
-        cands = sorted(Path("results").glob("gemm_*.json"))
-        if not cands:
-            raise SystemExit("no results/gemm_*.json — pass --results or run run.py")
-        path = str(cands[-1])
+    path = args.results or "results/gemm_bf16.json"
+    if not Path(path).exists():
+        raise SystemExit(f"no {path} — pass --results or run run.py")
     p = Predictor.from_json(path)
 
     if p.op == "attn":

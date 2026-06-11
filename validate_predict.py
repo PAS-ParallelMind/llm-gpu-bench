@@ -95,9 +95,7 @@ def _summary(pred_all, roof_all, meas_all=None) -> None:
 def validate_gemm(args, dtype: str) -> None:
     recs = run_gemm_sweep(MODEL_SHAPES, VAL_MS, [dtype], device=args.device,
                           iters=args.iters, warmup=args.warmup)
-    cands = sorted(Path("results").glob("gemm_*.json"))   # gemm_<gpu> (bf16/fp16) vs gemm_mxfp4_<gpu>
-    cands = [c for c in cands if ("mxfp4" in c.name) == (dtype == "mxfp4")]
-    path = args.results or str(cands[-1])
+    path = args.results or f"results/gemm_{dtype}.json"
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   {dtype}   validating {len(MODEL_SHAPES)} real projections\n")
@@ -125,7 +123,7 @@ def validate_gemm(args, dtype: str) -> None:
 
 def validate_attn(args) -> None:
     import attn
-    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
+    path = args.results or "results/attn_bf16.json"
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   attention   {len(ATTN_CONFIGS)} head configs x "
@@ -147,7 +145,7 @@ def validate_attn(args) -> None:
 def validate_mixed(args) -> None:
     """Mixed prefill+decode steps: does the step compose as t_prefill + t_decode?"""
     import attn
-    path = args.results or str(sorted(Path("results").glob("attn_*.json"))[-1])
+    path = args.results or "results/attn_bf16.json"     # the attn sweep grid
     pred = Predictor.from_json(path)
 
     print(f"grid: {path}   mixed continuous-batching steps   "
@@ -177,9 +175,7 @@ def validate_mixed(args) -> None:
 
 def validate_moe(args, quant: str) -> None:
     import moe
-    cands = sorted(Path("results").glob("moe_*.json"))
-    cands = [c for c in cands if ("mxfp4" in c.name) == (quant == "mxfp4")]
-    path = args.results or str(cands[-1])
+    path = args.results or f"results/moe_{quant}.json"
     pred = Predictor.from_json(path)
 
     # mxfp4/Marlin needs 128-aligned dims; pad H,I up to 128 like production does (no-op for
