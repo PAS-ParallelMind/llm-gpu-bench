@@ -10,6 +10,10 @@ so they use different efficiency descriptors but route through one attn_latency_
     roofline over the causal trapezoid:
         FLOPs = 4·H·D·R·(S_q·S_kv − S_q(S_q−1)/2);  bytes = 2·elem·R·(S_q·H·D + S_kv·H_kv·D)
 
+MoE (op=moe): two grouped GEMMs (gate+up, down) under uniform routing; eff interpolated over
+(log T, log E, log H, log I) with T=M·top_k routed tokens, E_act=min(E,T) active experts:
+    FLOPs = 6·T·H·I;  bytes = E_act·3·H·I·elem + 2·M·H·elem
+
 Pure stdlib — prediction needs no GPU or torch. Measurement lives in run.py.
 """
 from __future__ import annotations
@@ -51,6 +55,9 @@ class Predictor:
     attn_axes: tuple = field(default_factory=tuple)              # (Sqs, Sks, RHs, Ds)
     attn_decode_curve: list = field(default_factory=list)        # sorted [(log KV_bytes, eff)]
     attn_backend: str = "flashinfer"                             # library the grid was measured on
+    moe_c: float = 0.0                                           # TFLOP/s (moe compute ceiling)
+    moe_eff: dict = field(default_factory=dict)                  # {(T,E,H,I): eff}  T=M*top_k
+    moe_axes: tuple = field(default_factory=tuple)               # (Ts, Es, Hs, Is)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
@@ -65,6 +72,11 @@ class Predictor:
             return cls(b_peak=b_peak, op="attn", attn_c=float(d["c_peak_tflops"]),
                        attn_eff=geff, attn_axes=gaxes, attn_decode_curve=dcurve,
                        attn_backend=d.get("backend", "flashinfer"))
+        if op == "moe":
+            meff = {(r["M"] * r["top_k"], r["E"], r["H"], r["I"]): r["efficiency"] for r in d["moe"]}
+            maxes = tuple(sorted({k[i] for k in meff}) for i in range(4))   # (Ts, Es, Hs, Is)
+            return cls(b_peak=b_peak, op="moe", moe_c=float(d["c_peak_tflops"]),
+                       moe_eff=meff, moe_axes=maxes)
         c_peak = {k: float(v) for k, v in d["c_peak"].items()}
         # bf16/fp16 read & write 2 bytes/elem; quant schemes override via the JSON.
         bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0})
@@ -156,6 +168,33 @@ class Predictor:
     def attn_latency_ms(self, R, Sq, Sk, H, H_kv, D):
         return self.attn_roofline_ms(R, Sq, Sk, H, H_kv, D) / self.attn_efficiency(R, Sq, Sk, H, H_kv, D)
 
+    # --- MoE: two grouped GEMMs (uniform routing); efficiency over (log T, log E, log H, log I) ---
+    def moe_roofline_ms(self, M, E, top_k, H, I, elem=2):
+        T = M * top_k
+        E_act = min(E, T)                              # only top_k experts fire at small M
+        flops = 6 * T * H * I                          # gate+up (4THI) + down (2THI)
+        nbytes = E_act * 3 * H * I * elem + 2 * M * H * elem
+        return max(flops / (self.moe_c * 1e12), nbytes / (self.b_peak * 1e9)) * 1e3
+
+    def moe_efficiency(self, M, E, top_k, H, I):
+        T = M * top_k
+        Ts, Es, Hs, Is = self.moe_axes
+        tot = wsum = 0.0
+        for ti, wt in self._bracket(Ts, T):
+            for ei, we in self._bracket(Es, E):
+                for hi, wh in self._bracket(Hs, H):
+                    for ii, wi in self._bracket(Is, I):
+                        e = self.moe_eff.get((Ts[ti], Es[ei], Hs[hi], Is[ii]))
+                        if e is None or e != e:
+                            continue
+                        w = wt * we * wh * wi
+                        tot += w * e
+                        wsum += w
+        return tot / wsum if wsum > 0 else float("nan")
+
+    def moe_latency_ms(self, M, E, top_k, H, I):
+        return self.moe_roofline_ms(M, E, top_k, H, I) / self.moe_efficiency(M, E, top_k, H, I)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -168,6 +207,8 @@ def main() -> None:
     # attention: one (R, S_q, S_kv) case + head config (H, H_kv, D)
     ap.add_argument("--attn", nargs=3, type=int, metavar=("R", "S_q", "S_kv"), default=None)
     ap.add_argument("--head", nargs=3, type=int, metavar=("H", "H_kv", "D"), default=[32, 8, 128])
+    # moe: expert config (E, top_k, H, I); sweeps --M
+    ap.add_argument("--moe", nargs=4, type=int, metavar=("E", "top_k", "H", "I"), default=None)
     args = ap.parse_args()
 
     path = args.results
@@ -189,6 +230,21 @@ def main() -> None:
             e = p.attn_efficiency(R, Sq, Sk, H, H_kv, D)
             rl = p.attn_roofline_ms(R, Sq, Sk, H, H_kv, D)
             print(f"  {R:>4} {Sq:>6} {Sk:>7} {e:>6.2f} {rl:>8.3f}ms {rl/e:>8.3f}ms")
+        return
+
+    if p.op == "moe":
+        E, top_k, H, I = args.moe if args.moe else [128, 8, 2048, 768]
+        print(f"{path}  |  MoE  |  C_peak {p.moe_c:.0f} TFLOP/s  B_peak {p.b_peak:.0f} GB/s")
+        print(f"predict MoE E={E} top_k={top_k} H={H} I={I}\n")
+        print(f"  {'M':>6} {'T':>8} {'regime':>7} {'eff':>6} {'roofline':>10} {'predicted':>10}")
+        for M in args.M:
+            T, E_act = M * top_k, min(E, M * top_k)
+            tc = 6 * T * H * I / (p.moe_c * 1e12)
+            tm = (E_act * 3 * H * I * 2 + 2 * M * H * 2) / (p.b_peak * 1e9)
+            reg = "compute" if tc > tm else "memory"
+            e = p.moe_efficiency(M, E, top_k, H, I)
+            rl = p.moe_roofline_ms(M, E, top_k, H, I)
+            print(f"  {M:>6} {T:>8} {reg:>7} {e:>6.2f} {rl:>8.3f}ms {rl/e:>8.3f}ms")
         return
 
     if args.shape is None:

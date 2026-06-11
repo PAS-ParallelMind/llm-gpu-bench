@@ -68,6 +68,14 @@ MIXED_CASES = [   # (label, n_p, S_q_p, S_kv_p, n_d, S_kv_d)
     ("nd-sweep 128",   4, 2048, 2048,  128, 8192),
 ]
 
+# MoE: real expert configs (E, top_k, H, I) the grid never saw, swept over token counts
+# M (decode -> prefill). gpt-oss-20b: 32 experts top-4; Qwen3-30B-A3B: 128 experts top-8.
+MOE_CONFIGS: dict[str, tuple[int, int, int, int]] = {
+    "gptoss": (32, 4, 2880, 2880),
+    "qwen":   (128, 8, 2048, 768),
+}
+MOE_VAL_M = [1, 16, 64, 256, 1024, 4096]
+
 
 def _summary(pred_all, roof_all, meas_all=None) -> None:
     pe, re = np.array(pred_all), np.array(roof_all)
@@ -172,10 +180,30 @@ def validate_mixed(args) -> None:
           f"median {np.median(es)*100:.1f}%  max {es.max()*100:.1f}%")
 
 
+def validate_moe(args) -> None:
+    import moe
+    path = args.results or str(sorted(Path("results").glob("moe_*.json"))[-1])
+    pred = Predictor.from_json(path)
+
+    print(f"grid: {path}   MoE   {len(MOE_CONFIGS)} expert configs x {len(MOE_VAL_M)} token counts\n")
+    print(f"  {'config':8} {'E':>4} {'tk':>3} {'H':>5} {'I':>5} {'M':>5} | {'pred':>5} {'roof':>5} | {'meas':>9}")
+    pred_all, roof_all, meas_all = [], [], []
+    for name, (E, tk, H, I) in MOE_CONFIGS.items():
+        for M in MOE_VAL_M:
+            meas = moe.measure_moe_ms(M, E, tk, H, I, device=args.device,
+                                      iters=args.iters, warmup=args.warmup)
+            ep = abs(pred.moe_latency_ms(M, E, tk, H, I) - meas) / meas
+            er = abs(pred.moe_roofline_ms(M, E, tk, H, I) - meas) / meas
+            pred_all.append(ep); roof_all.append(er); meas_all.append(meas)
+            print(f"  {name:8} {E:>4} {tk:>3} {H:>5} {I:>5} {M:>5} | "
+                  f"{ep*100:>4.0f}% {er*100:>4.0f}% | {meas:8.3f} ms")
+    _summary(pred_all, roof_all, meas_all)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed"])
+                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed", "moe_bf16"])
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--iters", type=int, default=50)
@@ -187,6 +215,8 @@ def main() -> None:
         validate_mixed(args)
     elif op == "attn":
         validate_attn(args)
+    elif op == "moe":
+        validate_moe(args)
     else:
         validate_gemm(args, dtype)
 
