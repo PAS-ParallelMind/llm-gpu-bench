@@ -3,7 +3,7 @@
 For ``y = x @ W^T`` with ``x:[M,K]``, ``W:[N,K]`` (vLLM's ``F.linear`` layout):
 
     FLOPs = 2 * M * N * K
-    bytes = w*N*K + a*M*K + o*M*N            # read W, read x, write y  (bytes/elem per dtype)
+    bytes = w*N*K + a*(M*K + M*N)            # read W, read x, write y  (w/a bytes/elem per dtype)
     arithmetic intensity = FLOPs / bytes ~= M   (for M << N, K)
 
 So sweeping ``M`` walks each projection from memory-bound (decode, small M) up
@@ -38,11 +38,12 @@ _DTYPES: dict[str, torch.dtype] = {
 MXFP4_GROUP = 32
 _W_BYTES_MXFP4 = 0.5 + 1.0 / MXFP4_GROUP            # 4 bits + one E8M0 scale/32 = 0.53125
 
-# byte model as {weight, activation, output} bytes/elem per dtype — shared with the predictor.
+# byte model as {weight, activation} bytes/elem per dtype — shared with the predictor.
+# "a" covers both the activation read and the output write (same dtype).
 BYTES_MODEL: dict[str, dict[str, float]] = {
-    "bf16":  {"w": 2.0, "a": 2.0, "o": 2.0},
-    "fp16":  {"w": 2.0, "a": 2.0, "o": 2.0},
-    "mxfp4": {"w": _W_BYTES_MXFP4, "a": 2.0, "o": 2.0},
+    "bf16":  {"w": 2.0, "a": 2.0},
+    "fp16":  {"w": 2.0, "a": 2.0},
+    "mxfp4": {"w": _W_BYTES_MXFP4, "a": 2.0},
 }
 
 # ---------------------------------------------------------------------------
@@ -95,7 +96,7 @@ class GemmRecord:
 
 def gemm_bytes(dtype: str, M: int, K: int, N: int) -> float:
     bm = BYTES_MODEL[dtype]
-    return bm["w"] * N * K + bm["a"] * M * K + bm["o"] * M * N
+    return bm["w"] * N * K + bm["a"] * (M * K + M * N)   # weight read + (activation read + output write)
 
 
 def make_mxfp4_weight(N: int, K: int, device: torch.device, group_size: int = MXFP4_GROUP):

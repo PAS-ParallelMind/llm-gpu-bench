@@ -276,7 +276,7 @@ and still loads pre-unification files):
       "hardware":  { "gpu", "c_peak_tflops", "b_peak_gbps" },
       "operation": { "bench",                 # e.g. "gemm_bf16", "attn_bf16", "moe_mxfp4"
                      "impl",                   # {"torch"/"vllm"/"flashinfer": version}
-                     "bytes_model" },          # {"w","a","o"} (gemm/moe) or {"elem"} (attn)
+                     "bytes_model" },          # {"w","a"} bytes/elem (weight, activation); attn w=0
       "results": [ { "shape":      { … op-specific input dims … },
                      "latency_ms",             # average latency
                      "tflops",                 # achieved compute throughput

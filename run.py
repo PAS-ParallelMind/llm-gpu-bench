@@ -55,7 +55,7 @@ def _run_attn(args, props, dtype: str) -> None:
     results = [r.result() for r in decode] + [r.result() for r in grid]
     out = args.out or f"results/{args.bench}.json"
     _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
-          {"flashinfer": flashinfer.__version__}, {"elem": 2}, results)
+          {"flashinfer": flashinfer.__version__}, {"w": 0.0, "a": 2.0}, results)  # attn: no weights
 
 
 def _run_moe(args, props, dtype: str) -> None:

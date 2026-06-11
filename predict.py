@@ -49,7 +49,7 @@ class Predictor:
     c_peak: dict[str, float] = field(default_factory=dict)       # TFLOP/s per dtype (gemm)
     axes: dict = field(default_factory=dict)                     # dtype -> (Ms,Ks,Ns) (gemm)
     eff: dict = field(default_factory=dict)                      # dtype -> {(M,K,N): eff} (gemm)
-    bytes_model: dict[str, float] = field(default_factory=lambda: {"w": 2.0, "a": 2.0, "o": 2.0})
+    bytes_model: dict[str, float] = field(default_factory=lambda: {"w": 2.0, "a": 2.0})
     attn_c: float = 0.0                                          # TFLOP/s (attn compute ceiling)
     attn_eff: dict = field(default_factory=dict)                 # {(Sq,Sk,RH,D): eff} (prefill grid)
     attn_axes: tuple = field(default_factory=tuple)              # (Sqs, Sks, RHs, Ds)
@@ -95,7 +95,7 @@ class Predictor:
         axes = {dt: (sorted({k[0] for k in t}), sorted({k[1] for k in t}), sorted({k[2] for k in t}))
                 for dt, t in eff.items()}
         return cls(b_peak=b_peak, op="gemm", c_peak={dtype: c_peak}, axes=axes, eff=eff,
-                   bytes_model=opn.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0}))
+                   bytes_model=opn.get("bytes_model", {"w": 2.0, "a": 2.0}))
 
     @classmethod
     def _from_legacy(cls, d: dict) -> "Predictor":
@@ -117,7 +117,7 @@ class Predictor:
                        moe_eff=meff, moe_axes=maxes,
                        moe_bytes_model=d.get("moe_bytes_model", {"w": 2.0, "a": 2.0}))
         c_peak = {k: float(v) for k, v in d["c_peak"].items()}
-        bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0, "o": 2.0})
+        bytes_model = d.get("bytes_model", {"w": 2.0, "a": 2.0})   # legacy files may carry "o"; ignored
         eff: dict = {}
         for r in d["gemm"]:
             res = r.get("residual", 0.0)
@@ -146,7 +146,7 @@ class Predictor:
 
     def _ideal_mem_s(self, M, K, N, dtype):
         bm = self.bytes_model
-        return (bm["w"] * N * K + bm["a"] * M * K + bm["o"] * M * N) / (self.b_peak * 1e9)
+        return (bm["w"] * N * K + bm["a"] * (M * K + M * N)) / (self.b_peak * 1e9)
 
     def roofline_ms(self, M, K, N, dtype="bf16"):
         return max(self._ideal_compute_s(M, K, N, dtype),
