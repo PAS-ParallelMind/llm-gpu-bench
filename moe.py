@@ -9,7 +9,7 @@ Two quant schemes, differing only in the **weight byte model** (FLOPs are identi
 dequants 4-bit weights to bf16 and runs the same bf16 tensor cores on Ada):
   * bf16  : fused_experts (Triton);          weights 2 bytes/elem.
   * mxfp4 : fused_marlin_moe (w4a16 Marlin);  weights ~0.53 bytes/elem (4-bit + E8M0 scale/32),
-            bf16 activations. Per-expert Marlin weights built via gemm.make_mxfp4_weight.
+            bf16 activations. Per-expert Marlin weights built via make_mxfp4_weight (below).
 
   routed tokens  T    = M * top_k ;  active experts E_act = min(E, T)
   FLOPs = 6 * T * H * I            (gate+up 4*T*H*I + down 2*T*H*I)
@@ -39,6 +39,30 @@ MOE_TOPK = 8                                # benchmark top_k; efficiency is key
 
 # Weight bytes/elem per scheme (mxfp4: 4-bit weight + 1-byte E8M0 scale per 32 elems = 0.53125).
 WEIGHT_BYTES = {"bf16": 2.0, "mxfp4": 0.53125}
+MXFP4_GROUP = 32                            # E8M0 scale group size
+
+
+def make_mxfp4_weight(N: int, K: int, device: torch.device, group_size: int = MXFP4_GROUP):
+    """Random Marlin-format mxfp4 weight + E8M0 scales (no bf16 reference) for one [N, K]
+    matrix. Mirrors vLLM's rand_marlin_weight_mxfp4_like (random fp4 -> repack ->
+    permute/process-scales); we only time the kernel, so the dequantized reference is dropped.
+    Used per-expert to build the Marlin MoE weights."""
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import marlin_permute_scales
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
+        mxfp4_marlin_process_scales,
+    )
+    scales = torch.randint(110, 120, (N, K // group_size), dtype=torch.uint8,
+                           device=device).view(torch.float8_e8m0fnu)
+    fp4 = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=device)
+    fp4 = fp4.view(torch.int32).T.contiguous()
+    perm = torch.empty(0, dtype=torch.int, device=device)
+    qweight = ops.gptq_marlin_repack(b_q_weight=fp4, perm=perm, size_k=K, size_n=N,
+                                     num_bits=4, is_a_8bit=False)
+    s = marlin_permute_scales(s=scales.T.to(torch.bfloat16), size_k=K, size_n=N,
+                              group_size=group_size, is_a_8bit=False)
+    s = mxfp4_marlin_process_scales(s, input_dtype=None)
+    return qweight, s.to(torch.float8_e8m0fnu)
 
 
 def moe_flops(M: int, top_k: int, H: int, I: int) -> int:
@@ -60,8 +84,6 @@ def _uniform_routing(M, E, top_k, dev):
 
 def _marlin_moe_weights(E, H, I, dev):
     """Per-expert mxfp4 Marlin weights, stacked: w1 [E, H//16, 4I], w2 [E, I//16, 2H]."""
-    from gemm import make_mxfp4_weight
-
     def stack(N, K):
         qs, ss = zip(*[make_mxfp4_weight(N, K, dev) for _ in range(E)])
         return torch.stack(qs).contiguous(), torch.stack(ss).contiguous()

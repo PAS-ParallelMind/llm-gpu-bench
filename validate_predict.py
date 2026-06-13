@@ -6,7 +6,7 @@ roofline, no benchmark data) — so the relative error shows how much the benchm
 data improves the analytic roofline.
 
     python3 validate_predict.py                       # gemm_bf16 (real projections)
-    python3 validate_predict.py --bench gemm_mxfp4    # mxfp4 w4a16
+    python3 validate_predict.py --bench moe_mxfp4     # mxfp4 w4a16 MoE
     python3 validate_predict.py --bench attn_bf16     # decode attention, real head configs
 """
 from __future__ import annotations
@@ -209,7 +209,7 @@ def validate_moe(args, quant: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "attn_mixed",
+                    choices=["gemm_bf16", "gemm_fp16", "attn_bf16", "attn_mixed",
                              "moe_bf16", "moe_mxfp4"])
     ap.add_argument("--results", default=None)
     ap.add_argument("--device", type=int, default=0)

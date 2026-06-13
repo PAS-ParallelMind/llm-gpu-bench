@@ -27,7 +27,7 @@ if [ -z "$CPEAK" ] || [ -z "$BPEAK" ]; then
 fi
 
 # Every op_dtype the suite supports (see run.py --bench).
-BENCHES=(gemm_bf16 gemm_mxfp4 attn_bf16 moe_bf16 moe_mxfp4)
+BENCHES=(gemm_bf16 attn_bf16 moe_bf16 moe_mxfp4)
 
 FAILED=()
 for b in "${BENCHES[@]}"; do

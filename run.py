@@ -1,15 +1,15 @@
 """Run a kernel benchmark, score efficiency vs the roofline, dump JSON.
 
     python3 run.py --bench gemm_bf16   --c-peak 165 --b-peak 1008   # RTX 4090
-    python3 run.py --bench gemm_mxfp4  --c-peak 165 --b-peak 1008   # w4a16 (vLLM Marlin)
+    python3 run.py --bench moe_mxfp4   --c-peak 165 --b-peak 1008   # w4a16 MoE (vLLM Marlin)
     python3 run.py --bench attn_bf16   --c-peak 165 --b-peak 1008   # flash-attn (decode+prefill)
     python3 run.py --bench gemm_bf16 --shapes k2048_n4096 --c-peak 165 --b-peak 1008
 
 --bench is <op>_<dtype>: gemm_bf16 / gemm_fp16 go through torch's F.linear (cuBLAS /
-cuBLASLt / CUTLASS per shape); gemm_mxfp4 goes through the vLLM Marlin w4a16 kernel;
-attn_bf16 sweeps flash-attention (FlashInfer, paged KV; best of its fa2/fa3/cutlass/
-trtllm-gen kernels per shape) — a decode KV-byte curve plus a prefill (S_q, S_kv, R·H)
-× D grid. Each writes its own results file.
+cuBLASLt / CUTLASS per shape); attn_bf16 sweeps flash-attention (FlashInfer, paged KV; best
+of its fa2/fa3/cutlass/trtllm-gen kernels per shape) — a decode KV-byte curve plus a prefill
+(S_q, S_kv, R·H) × D grid; moe_bf16 / moe_mxfp4 sweep the fused-MoE grouped GEMM (Triton /
+Marlin). Each writes its own results file.
 
 GEMM and prefill attention need the theoretical roofline ceiling via --c-peak (TFLOP/s)
 and --b-peak (GB/s); decode attention is always memory-bound, so --b-peak carries it. The
@@ -80,7 +80,7 @@ def _run_moe(args, props, dtype: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "gemm_mxfp4", "attn_bf16", "moe_bf16", "moe_mxfp4"],
+                    choices=["gemm_bf16", "gemm_fp16", "attn_bf16", "moe_bf16", "moe_mxfp4"],
                     help="which benchmark to run (<op>_<dtype>).")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,
@@ -116,13 +116,8 @@ def main() -> None:
     shapes = SHAPES if not args.shapes else {k: SHAPES[k] for k in args.shapes}
     c_peak, b_peak = args.c_peak, args.b_peak
 
-    if dtype == "mxfp4":
-        import vllm                                        # Marlin kernel ships in vLLM
-        print("\n== gemm_mxfp4 (Marlin w4a16) ==")
-        lib = {"vllm": vllm.__version__}
-    else:
-        print("\n== gemm (torch F.linear) ==")
-        lib = {"torch": torch.__version__}                # the F.linear GEMM ships in torch
+    print("\n== gemm (torch F.linear) ==")
+    lib = {"torch": torch.__version__}                    # the F.linear GEMM ships in torch
     default_out = f"results/{args.bench}.json"
     recs = run_gemm_sweep(shapes, DEFAULT_MS, [dtype],
                           device=dev, iters=args.iters, warmup=args.warmup)
