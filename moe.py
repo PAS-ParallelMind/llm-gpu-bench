@@ -151,18 +151,23 @@ def _triton_moe_weights(E, H, I, dev):
 
 
 def _triton_call(M, E, top_k, H, I, dt, dev):
-    """w4a16 Triton kernel via triton_kernel_moe_forward (routes from logits)."""
-    from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
-        triton_kernel_moe_forward,
-    )
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
-        Mxfp4MoeBackend, make_mxfp4_moe_quant_config,
-    )
+    """w4a16 Triton kernel via triton_kernel_moe_forward (routes from logits). The quant config
+    comes straight from config.mxfp4_w4a16_moe_quant_config (present in both vLLM 0.16 and
+    0.22+, and what the oracle's TRITON branch forwards to); the swiglu clamp params aren't
+    passed -- the functional kernel uses its own defaults -- so the call is version-portable."""
+    try:                          # vLLM 0.18+: experts/ subpackage
+        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+            triton_kernel_moe_forward,
+        )
+    except ModuleNotFoundError:   # vLLM <= 0.16: flat layout, no experts/ subpackage
+        from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
+            triton_kernel_moe_forward,
+        )
+    from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
     x = torch.randn(M, H, device=dev, dtype=dt)
     gating = torch.randn(M, E, device=dev, dtype=dt)            # router logits (routed internally)
     w13, w2, w13_pc, w2_pc = _triton_moe_weights(E, H, I, dev)
-    qcfg = make_mxfp4_moe_quant_config(Mxfp4MoeBackend.TRITON, w1_scale=w13_pc, w2_scale=w2_pc,
-                                       gemm1_alpha=1.702, gemm1_beta=1.0, swiglu_limit=7.0)
+    qcfg = mxfp4_w4a16_moe_quant_config(w1_scale=w13_pc, w2_scale=w2_pc)
     fn = lambda: triton_kernel_moe_forward(x, w13, w2, gating, topk=top_k, renormalize=True,
                                            quant_config=qcfg, global_num_experts=E)
     return fn, (x, gating, w13, w2, w13_pc, w2_pc)
