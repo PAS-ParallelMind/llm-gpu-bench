@@ -71,6 +71,10 @@ def _run_moe(args, props, dtype: str) -> None:
     print(f"  ceiling: C_peak {args.c_peak:.0f} TFLOP/s   B_peak {args.b_peak:.0f} GB/s")
     print(f"  {len(recs)} points; efficiency "
           f"{min(r.efficiency for r in recs):.2f} .. {max(r.efficiency for r in recs):.2f}")
+    won: dict[str, int] = {}
+    for r in recs:
+        won[r.backend] = won.get(r.backend, 0) + 1
+    print("  winning kernels: " + ", ".join(f"{k}×{v}" for k, v in sorted(won.items())))
     out = args.out or f"results/{args.bench}.json"
     _dump(out, props.name, args.c_peak, args.b_peak, args.bench,
           {"vllm": vllm.__version__}, {"w": WEIGHT_BYTES[quant], "a": 2.0},

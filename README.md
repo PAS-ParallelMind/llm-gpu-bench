@@ -152,16 +152,30 @@ the prefill path (e.g. vLLM's FlashAttention/FA2 on Ada, where `num_splits>1` is
 loses decode's split-KV — it is **1.1–5.8× slower on mixed steps and not composable** (sum
 mispredicts by ~50%). That is the concrete reason FlashInfer is the targeted backend here.
 
-## MoE (vLLM — Triton bf16 + Marlin mxfp4)
+## MoE (vLLM — Triton bf16 + best-of mxfp4 w4a16)
 
 A fourth op. A fused-MoE layer routes each of M tokens to top_k of E experts, then runs two
 grouped GEMMs per expert: gate+up (`H→2I`), SiLU, down (`I→H`). We **model it as those two
 grouped GEMMs under uniform routing** (the analytic roofline) but **measure the real kernel**,
 so fusion + routing land in the efficiency factor — same roofline ÷ efficiency split as the
 other ops. Two schemes (`--bench moe_bf16` / `moe_mxfp4`) differing only in the weight byte
-model — `fused_experts` (Triton, bf16, 2 B/elem) and `fused_marlin_moe` (w4a16 Marlin, mxfp4
-4-bit + E8M0 scale ≈ 0.53 B/elem; FLOPs identical since Marlin dequants to bf16 tensor cores).
-Only the weight byte model differs between the two schemes.
+model — bf16 (`fused_experts`, Triton, 2 B/elem) and mxfp4 w4a16 (4-bit + E8M0 scale ≈ 0.53
+B/elem; FLOPs identical since the 4-bit kernels dequant to bf16 tensor cores).
+
+The **mxfp4 scheme is best-of-backends like attention**: per shape we try every vLLM mxfp4 MoE
+kernel that runs on the GPU — **Marlin** (`fused_marlin_moe`) and the **Triton** kernel
+(`triton_kernel_moe_forward`; OpenAI's `triton_kernels` package, currently adopted by gpt-oss)
+— skip the unsupported, keep the fastest, and record which won. On Ada (RTX 4090) only Marlin
+runs; the Triton kernel needs SM90–100 + the `triton_kernels` package, so it is picked up on
+Hopper/Blackwell.
+
+> **Backends not covered.** This is *not* an exhaustive sweep of vLLM's mxfp4 MoE backends.
+> Excluded: the **FlashInfer TRTLLM/CUTLASS** modular kernels (SM90/SM100) and **DeepGEMM** —
+> class-based modular kernels with no functional entry, so driving them means standing up
+> vLLM's layer machinery; and the **activation-quantized w4a8 variants** (FlashInfer MXFP8,
+> DeepGEMM FP8, AITER) — a *different precision* (8-bit activations → a different byte model),
+> not directly comparable to this w4a16 sweep. Also out of scope: ROCm/XPU/CPU backends. Adding
+> the FlashInfer pair (the main gap on Blackwell) is future work; see the `moe.py` docstring.
 
     routed tokens  T = M·top_k ;  active experts E_act = min(E, T) ;  per-expert tokens T/E_act
     FLOPs = 6·T·H·I  (gate+up 4·T·H·I + down 2·T·H·I)
@@ -194,16 +208,17 @@ and contributes nothing to real latency (hence the 2.5% latency-weighted error).
 
 The Triton path uses whatever config vLLM selects (default heuristic where no tuned JSON
 exists — exactly what serving runs); tuned-vs-untuned cancels in roofline ÷ efficiency, so no
-autotuning is needed. The **mxfp4 (Marlin)** scheme reuses the same grid/roofline with the
-weight byte model swapped (per-expert mxfp4 Marlin weights via `marlin.make_mxfp4_weight`);
-the predictor reads `moe_bytes_model` from the JSON.
+autotuning is needed. The **mxfp4 w4a16** scheme reuses the same grid/roofline with the weight
+byte model swapped — per-expert Marlin weights via `moe.make_mxfp4_weight`, Triton weights via
+vLLM's `_swizzle_mxfp4` — and the predictor reads `moe_bytes_model` from the JSON. The winning
+kernel per shape is recorded in each result's `shape.backend`.
 
 ## Files
 
     timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
     gemm.py               GEMM sweep (bf16/fp16 via torch F.linear), model-agnostic grid, roofline (torch)
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
-    moe.py                MoE sweep: Triton bf16 + Marlin mxfp4, two-grouped-GEMM roofline (torch+vLLM)
+    moe.py                MoE sweep: Triton bf16 + best-of mxfp4 (Marlin/Triton), two-grouped-GEMM roofline (torch+vLLM)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
     run_all.sh            run every benchmark for one GPU (--c-peak/--b-peak)         (bash)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM) (stdlib)
@@ -222,7 +237,7 @@ or one at a time:
     python run.py --bench gemm_bf16  --c-peak 165 --b-peak 1008   # bf16 GEMM grid
     python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008   # FlashInfer attn (best of kernels)
     python run.py --bench moe_bf16   --c-peak 165 --b-peak 1008   # MoE fused_experts (Triton bf16)
-    python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (Marlin mxfp4)
+    python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (best of Marlin/Triton)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
     python predict.py --results results/attn_bf16.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
     python predict.py --results results/moe_bf16.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
@@ -230,7 +245,7 @@ or one at a time:
     python validate_predict.py --bench attn_bf16                  # attention accuracy
     python validate_predict.py --bench attn_mixed                 # mixed-step composition (t_pf+t_dec)
     python validate_predict.py --bench moe_bf16                   # moe accuracy (Triton bf16)
-    python validate_predict.py --bench moe_mxfp4                  # moe accuracy (Marlin mxfp4)
+    python validate_predict.py --bench moe_mxfp4                  # moe accuracy (best of Marlin/Triton)
 
 The sweep needs torch + a CUDA GPU (mxfp4 needs vLLM/Marlin, attn needs FlashInfer);
 prediction does not. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is
@@ -263,15 +278,17 @@ measured throughputs for inspection.
 - GPU: **RTX 4090** (Ada, SM89). No FP4 tensor cores, so mxfp4 is weight-only
   dequant→bf16 (memory win, not compute).
 - Done: **bf16 GEMM** + **flash-attention (FlashInfer, hybrid: decode KV-byte curve +
-  prefill grid)** + **fused MoE (Triton bf16 + Marlin mxfp4 w4a16, two-grouped-GEMM)** —
+  prefill grid)** + **fused MoE (Triton bf16 + best-of mxfp4 w4a16, two-grouped-GEMM)** —
   benchmark, predictor, and validation, all via `run.py --bench <op>_<dtype>`. (mxfp4 is in
   the MoE experts only — no model uses 4-bit dense projections.)
 - Attention targets **FlashInfer** and per shape keeps the **best of its kernels**
   (fa2/fa3/cutlass/trtllm-gen, skipping unsupported) — best-achievable efficiency, portable
   to Hopper/Blackwell. Because FlashInfer splits decode/prefill, continuous batching composes
   additively (mixed step = `t_prefill + t_decode`, ~1.8%).
-- MoE has two schemes: **bf16 (Triton `fused_experts`)** and **mxfp4 w4a16 (Marlin
-  `fused_marlin_moe`)** — only the weight byte model differs. Both validated (~2–4%
+- MoE has two schemes: **bf16 (Triton `fused_experts`)** and **mxfp4 w4a16** — only the weight
+  byte model differs. mxfp4 is **best-of-backends** (Marlin `fused_marlin_moe` + Triton
+  `triton_kernel_moe_forward`, skipping unsupported, fastest wins). Both validated (~2–4%
   latency-weighted); gpt-oss mxfp4 measured at 2944 (Marlin needs 128-aligned dims, as prod pads).
-- Next: a **MoE load-imbalance factor** beyond uniform routing; **best-of MoE backends**
-  (trtllm/flashinfer) for Blackwell; re-measure attention on Hopper to pick up `fa3`/`trtllm`.
+- Next: a **MoE load-imbalance factor** beyond uniform routing; the remaining **mxfp4 MoE
+  backends** (FlashInfer TRTLLM/CUTLASS, DeepGEMM) for Blackwell; re-measure attention on
+  Hopper to pick up `fa3`/`trtllm`.
