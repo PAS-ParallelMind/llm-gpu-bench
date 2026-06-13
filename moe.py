@@ -142,8 +142,8 @@ def _triton_moe_weights(E, H, I, dev):
     def build(N, K):                                # logical fp4 [E, N, K] -> packed + E8M0 scale
         w = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
         s = torch.randint(118, 128, (E, N, K // MXFP4_GROUP), dtype=torch.uint8, device=dev)
-        wt, flex, st = _swizzle_mxfp4(w, s)
-        return wt, PrecisionConfig(weight_scale=st, flex_ctx=FlexCtx(rhs_data=flex))
+        wt, flex, st = _swizzle_mxfp4(w, s, num_warps=8)   # 8 = vLLM's non-batched default;
+        return wt, PrecisionConfig(weight_scale=st, flex_ctx=FlexCtx(rhs_data=flex))  # required positional on 0.16
 
     w13, w13_pc = build(2 * I, H)                   # gate+up: out 2I, in H
     w2, w2_pc = build(H, I)                         # down:    out H,  in I
