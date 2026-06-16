@@ -119,10 +119,7 @@ def _bf16_call(M, E, top_k, H, I, dt, dev):
 
 def _marlin_call(M, E, top_k, H, I, dt, dev):
     """w4a16 Marlin via fused_marlin_moe (per-expert Marlin weights + bf16 activations)."""
-    try:
-        from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
-    except ModuleNotFoundError:   # vLLM <= 0.16: flat layout, no experts/ subpackage
-        from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
     from vllm.scalar_type import scalar_types
     x = torch.randn(M, H, device=dev, dtype=dt)
     tw, tid = _uniform_routing(M, E, top_k, dev)
@@ -142,8 +139,8 @@ def _triton_moe_weights(E, H, I, dev):
     def build(N, K):                                # logical fp4 [E, N, K] -> packed + E8M0 scale
         w = torch.randint(0, 256, (E, N, K // 2), dtype=torch.uint8, device=dev)
         s = torch.randint(118, 128, (E, N, K // MXFP4_GROUP), dtype=torch.uint8, device=dev)
-        wt, flex, st = _swizzle_mxfp4(w, s, num_warps=8)   # 8 = vLLM's non-batched default;
-        return wt, PrecisionConfig(weight_scale=st, flex_ctx=FlexCtx(rhs_data=flex))  # required positional on 0.16
+        wt, flex, st = _swizzle_mxfp4(w, s, num_warps=8)   # 8 = vLLM's non-batched-MoE value
+        return wt, PrecisionConfig(weight_scale=st, flex_ctx=FlexCtx(rhs_data=flex))
 
     w13, w13_pc = build(2 * I, H)                   # gate+up: out 2I, in H
     w2, w2_pc = build(H, I)                         # down:    out H,  in I
@@ -152,17 +149,12 @@ def _triton_moe_weights(E, H, I, dev):
 
 def _triton_call(M, E, top_k, H, I, dt, dev):
     """w4a16 Triton kernel via triton_kernel_moe_forward (routes from logits). The quant config
-    comes straight from config.mxfp4_w4a16_moe_quant_config (present in both vLLM 0.16 and
-    0.22+, and what the oracle's TRITON branch forwards to); the swiglu clamp params aren't
-    passed -- the functional kernel uses its own defaults -- so the call is version-portable."""
-    try:                          # vLLM 0.18+: experts/ subpackage
-        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
-            triton_kernel_moe_forward,
-        )
-    except ModuleNotFoundError:   # vLLM <= 0.16: flat layout, no experts/ subpackage
-        from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (
-            triton_kernel_moe_forward,
-        )
+    comes straight from config.mxfp4_w4a16_moe_quant_config (what the mxfp4 oracle's TRITON
+    branch forwards to); the swiglu clamp params aren't passed -- the functional kernel uses
+    its own defaults."""
+    from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
+        triton_kernel_moe_forward,
+    )
     from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
     x = torch.randn(M, H, device=dev, dtype=dt)
     gating = torch.randn(M, E, device=dev, dtype=dt)            # router logits (routed internally)
