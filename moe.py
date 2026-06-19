@@ -5,21 +5,23 @@ GEMMs per expert: gate+up (`H→2I`), SiLU, down (`I→H`). We model it as those
 GEMMs under *uniform* routing (the analytic roofline) but measure the real kernel, so fusion
 + routing land in the efficiency factor -- same roofline / measured split as gemm/attn.
 
-Two quant schemes, differing only in the **weight byte model** (FLOPs are identical -- all
-the 4-bit kernels dequant to bf16 and run the same bf16 tensor cores):
-  * bf16  : fused_experts (Triton);  weights 2 bytes/elem.
-  * mxfp4 : w4a16 (4-bit weights, ~0.53 bytes/elem incl. E8M0 scale/32; bf16 activations).
-            Best-of-backends like attention: per shape we try every vLLM mxfp4 MoE kernel
-            that runs on this GPU -- Marlin (fused_marlin_moe) and the Triton kernel
-            (triton_kernel_moe_forward; OpenAI's triton_kernels package, currently adopted by
-            gpt-oss) -- skip the unsupported, keep the FASTEST, and record which won. On Ada
-            (RTX 4090) only Marlin runs; the Triton kernel needs SM90-100 + the triton_kernels
-            package, so it is picked up on Hopper/Blackwell.
+Both schemes are **best-of-backends like attention**: per shape we try every vLLM MoE kernel
+that runs on this GPU, skip the unsupported, keep the FASTEST, and record which won. The two
+schemes differ only in the **weight byte model** (FLOPs are identical -- all the 4-bit kernels
+dequant to bf16 and run the same bf16 tensor cores):
+  * bf16  (w16a16; weights 2 bytes/elem):
+        - fused_experts      Triton grouped GEMM, any CUDA GPU (always available).
+        - flashinfer_cutlass FlashInfer CUTLASS,  SM90 / SM100 / SM120.
+        - flashinfer_trtllm  FlashInfer TRTLLM-Gen, SM100 (Blackwell) only.
+  * mxfp4 (w4a16; 4-bit weights ~0.53 bytes/elem incl. E8M0 scale/32, bf16 activations):
+        - marlin             fused_marlin_moe, any CUDA GPU.
+        - triton             OAI triton_kernels gpt-oss kernel, SM90-100 + triton_kernels.
+  On Ada (RTX 4090) only fused_experts (bf16) / marlin (mxfp4) run; the FlashInfer and OAI
+  Triton kernels are picked up on Hopper/Blackwell.
 
-  NOT every vLLM mxfp4 MoE backend is covered (see README): the FlashInfer TRTLLM/CUTLASS
-  modular kernels (SM90/SM100) and DeepGEMM have no functional entry (class-based modular
-  kernels), and the activation-quantized w4a8 variants (MXFP8 / FP8) are a *different
-  precision* with a different byte model -- both out of scope for this w4a16 best-of.
+  Still uncovered (see README): the mxfp4 FlashInfer TRTLLM/CUTLASS backends + DeepGEMM (the
+  mxfp4 FlashInfer weights need a block-scale swizzle, future work), and all activation-
+  quantized w4a8 variants (MXFP8 / FP8) -- a different precision with a different byte model.
 
   routed tokens  T    = M * top_k ;  active experts E_act = min(E, T)
   FLOPs = 6 * T * H * I            (gate+up 4*T*H*I + down 2*T*H*I)
@@ -51,10 +53,15 @@ MOE_TOPK = 8                                # benchmark top_k; efficiency is key
 WEIGHT_BYTES = {"bf16": 2.0, "mxfp4": 0.53125}
 MXFP4_GROUP = 32                            # E8M0 scale group size
 
-# mxfp4 w4a16 MoE kernels tried per shape (best wins; unsupported skipped). Marlin runs on any
-# CUDA GPU; the Triton kernel needs SM90-100 + the triton_kernels package, so on
-# Ada (RTX 4090) only Marlin runs. (Other vLLM mxfp4 backends -- FlashInfer TRTLLM/CUTLASS,
-# DeepGEMM, and the w4a8 MXFP8/FP8 variants -- are out of scope; see the module docstring.)
+# MoE kernels tried per shape (best wins; unsupported skipped), per weight scheme. Triton
+# fused_experts (bf16) and Marlin (mxfp4) run on any CUDA GPU; the rest need recent NVIDIA
+# archs + FlashInfer/triton_kernels, so on Ada (RTX 4090) only those two run:
+#   bf16  : fused_experts (Triton, any GPU) + FlashInfer CUTLASS (SM90/100/120) +
+#           FlashInfer TRTLLM-Gen (SM100 only).
+#   mxfp4 : Marlin (any GPU) + OAI Triton (SM90-100 + triton_kernels).
+# (Still uncovered, see module docstring: the mxfp4 FlashInfer backends, DeepGEMM, and all
+# w4a8 MXFP8/FP8 variants -- a different precision / byte model.)
+BF16_BACKENDS = ["fused_experts", "flashinfer_cutlass", "flashinfer_trtllm"]
 MXFP4_BACKENDS = ["marlin", "triton"]
 _moe_disabled: set = set()                  # backends unsupported on this GPU/install -> not retried
 
@@ -117,6 +124,52 @@ def _bf16_call(M, E, top_k, H, I, dt, dev):
     return (lambda: fused_experts(x, w1, w2, tw, tid)), (x, w1, w2, tw, tid)
 
 
+def _bf16_weights(E, H, I, dt, dev):
+    """Plain bf16 expert weights (no swizzle): w1 [E, 2I, H] gate+up, w2 [E, H, I] down."""
+    w1 = torch.randn(E, 2 * I, H, device=dev, dtype=dt) * 0.02
+    w2 = torch.randn(E, H, I, device=dev, dtype=dt) * 0.02
+    return w1, w2
+
+
+def _bf16_flashinfer_cutlass_call(M, E, top_k, H, I, dt, dev):
+    """bf16 (w16a16) via FlashInfer CUTLASS (flashinfer_cutlass_fused_moe). Plain weights,
+    pre-routed top-k, no quant scales -- mirrors FlashInferExperts.apply's unquantized branch."""
+    from vllm.utils.flashinfer import flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import ActivationType
+    x = torch.randn(M, H, device=dev, dtype=dt)
+    tw, tid = _uniform_routing(M, E, top_k, dev)
+    w1, w2 = _bf16_weights(E, H, I, dt, dev)
+    out = torch.empty(M, H, device=dev, dtype=dt)               # CUTLASS writes into a given buffer
+    fn = lambda: flashinfer_cutlass_fused_moe(
+        input=x, token_selected_experts=tid.to(torch.int), token_final_scales=tw,
+        fc1_expert_weights=w1, fc2_expert_weights=w2,
+        fc1_expert_biases=None, fc2_expert_biases=None,
+        swiglu_alpha=None, swiglu_beta=None, swiglu_limit=None,
+        output=out, output_dtype=dt, quant_scales=[], input_sf=None,
+        tp_size=1, tp_rank=0, ep_size=1, ep_rank=0,
+        activation_type=ActivationType.Swiglu,
+        use_deepseek_fp8_block_scale=False, use_mxfp8_act_scaling=False,
+        use_w4_group_scaling=False, tune_max_num_tokens=max(M, 1))
+    return fn, (x, w1, w2, tw, tid, out)
+
+
+def _bf16_flashinfer_trtllm_call(M, E, top_k, H, I, dt, dev):
+    """bf16 (w16a16) via FlashInfer TRTLLM-Gen (trtllm_bf16_moe, Blackwell-only). Routes from
+    logits internally -- mirrors TrtLlmBf16Experts.apply."""
+    import flashinfer
+    from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    x = torch.randn(M, H, device=dev, dtype=dt)
+    logits = torch.randn(M, E, device=dev, dtype=torch.float32)  # router logits (routed internally)
+    w1, w2 = _bf16_weights(E, H, I, dt, dev)
+    fn = lambda: flashinfer.fused_moe.trtllm_bf16_moe(
+        routing_logits=logits, routing_bias=None, hidden_states=x,
+        gemm1_weights=w1, gemm2_weights=w2, num_experts=E, top_k=top_k,
+        n_group=None, topk_group=None, intermediate_size=I,
+        local_expert_offset=0, local_num_experts=E, routed_scaling_factor=None,
+        routing_method_type=RoutingMethodType.Renormalize)
+    return fn, (x, logits, w1, w2)
+
+
 def _marlin_call(M, E, top_k, H, I, dt, dev):
     """w4a16 Marlin via fused_marlin_moe (per-expert Marlin weights + bf16 activations)."""
     from vllm.model_executor.layers.fused_moe.experts.marlin_moe import fused_marlin_moe
@@ -165,28 +218,45 @@ def _triton_call(M, E, top_k, H, I, dt, dev):
     return fn, (x, gating, w13, w2, w13_pc, w2_pc)
 
 
-_MOE_BUILDERS = {"fused_experts": _bf16_call, "marlin": _marlin_call, "triton": _triton_call}
+_MOE_BUILDERS = {"fused_experts": _bf16_call, "marlin": _marlin_call, "triton": _triton_call,
+                 "flashinfer_cutlass": _bf16_flashinfer_cutlass_call,
+                 "flashinfer_trtllm": _bf16_flashinfer_trtllm_call}
 
 
 def _backend_supported(backend: str, dev: torch.device) -> tuple[bool, str]:
-    """Cheap pre-flight: is this backend even runnable on this GPU/install? (bf16 + Marlin run
-    on any CUDA GPU; the Triton kernel needs SM90-100 + the triton_kernels package.)"""
+    """Cheap pre-flight: is this backend even runnable on this GPU/install? fused_experts + Marlin
+    run on any CUDA GPU; the rest need a recent NVIDIA arch + their library (vLLM's own gates):
+      triton (mxfp4 OAI)  : SM90-100 + triton_kernels
+      flashinfer_cutlass  : SM90 / SM100 / SM120 + flashinfer cutlass MoE
+      flashinfer_trtllm   : SM100 only           + flashinfer trtllm MoE"""
+    cap = torch.cuda.get_device_capability(dev)
     if backend == "triton":
-        cap = torch.cuda.get_device_capability(dev)
         if not ((9, 0) <= cap < (11, 0)):           # vLLM gates the triton_kernels to SM90..SM100
             return False, f"Triton needs SM90-100, have sm_{cap[0]}{cap[1]}"
         import importlib.util
         if importlib.util.find_spec("triton_kernels") is None:
             return False, "triton_kernels not installed"
+    elif backend == "flashinfer_cutlass":
+        if not (cap == (9, 0) or cap[0] in (10, 12)):   # FlashInferExperts: SM90 / SM10x / SM12x
+            return False, f"FlashInfer CUTLASS needs SM90/100/120, have sm_{cap[0]}{cap[1]}"
+        from vllm.utils.flashinfer import has_flashinfer_cutlass_fused_moe
+        if not has_flashinfer_cutlass_fused_moe():
+            return False, "flashinfer cutlass MoE not available"
+    elif backend == "flashinfer_trtllm":
+        if cap[0] != 10:                            # TrtLlmBf16Experts: Blackwell (SM10x) only
+            return False, f"FlashInfer TRTLLM needs SM100 (Blackwell), have sm_{cap[0]}{cap[1]}"
+        from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+        if not has_flashinfer_trtllm_fused_moe():
+            return False, "flashinfer trtllm MoE not available"
     return True, ""
 
 
 def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
-    """Best kernel for one MoE point: bf16 has the lone fused_experts; mxfp4 tries each of
-    MXFP4_BACKENDS, skips the unsupported (caching architectural failures in _moe_disabled),
-    and keeps the fastest. Returns (median_ms, backend, fn, bufs) with the winner's call live."""
-    cands = (["fused_experts"] if quant == "bf16"
-             else [b for b in MXFP4_BACKENDS if b not in _moe_disabled])
+    """Best kernel for one MoE point: tries each candidate for the scheme (bf16: BF16_BACKENDS,
+    mxfp4: MXFP4_BACKENDS), skips the unsupported (caching architectural failures in
+    _moe_disabled), and keeps the fastest. Returns (median_ms, backend, fn, bufs), winner live."""
+    cands = [b for b in (BF16_BACKENDS if quant == "bf16" else MXFP4_BACKENDS)
+             if b not in _moe_disabled]
     best = None
     for backend in cands:
         ok, why = _backend_supported(backend, dev)
