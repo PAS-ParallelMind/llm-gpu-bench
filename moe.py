@@ -270,6 +270,17 @@ def _announce_flashinfer_jit(backend: str) -> None:
               "a few minutes; it is cached afterward. Set MOE_NO_FLASHINFER=1 to skip FlashInfer.")
 
 
+def _flashinfer_tune(fn) -> None:
+    """Profile + cache FlashInfer's best tactic for this shape (one pass inside autotune()).
+    Without it FlashInfer runs its *fallback* tactic -- correct but unoptimised -- so it loses
+    to Triton on every shape; vLLM serving tunes the same way during its kernel warmup, so this
+    measures the tactic production actually uses."""
+    from flashinfer.autotuner import autotune
+    with autotune(tune_mode=True):
+        fn()
+    torch.cuda.synchronize()
+
+
 def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
     """Best kernel for one MoE point: tries each candidate for the scheme (bf16: BF16_BACKENDS,
     mxfp4: MXFP4_BACKENDS), skips the unsupported (caching architectural failures in
@@ -286,6 +297,8 @@ def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
         _announce_flashinfer_jit(backend)           # one-time heads-up: first call JIT-compiles
         try:
             fn, bufs = _MOE_BUILDERS[backend](M, E, top_k, H, I, dt, dev)
+            if backend.startswith("flashinfer"):   # tune the tactic first (else it runs fallback)
+                _flashinfer_tune(fn)
             ms = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms
         except Exception as e:
             torch.cuda.empty_cache()
