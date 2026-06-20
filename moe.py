@@ -32,6 +32,7 @@ Efficiency is keyed on T = M*top_k, so a model's own top_k folds in. Needs torch
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -228,8 +229,12 @@ def _backend_supported(backend: str, dev: torch.device) -> tuple[bool, str]:
     run on any CUDA GPU; the rest need a recent NVIDIA arch + their library (vLLM's own gates):
       triton (mxfp4 OAI)  : SM90-100 + triton_kernels
       flashinfer_cutlass  : SM90 / SM100 / SM120 + flashinfer cutlass MoE
-      flashinfer_trtllm   : SM100 only           + flashinfer trtllm MoE"""
+      flashinfer_trtllm   : SM100 only           + flashinfer trtllm MoE
+    Set MOE_NO_FLASHINFER=1 to skip both FlashInfer backends (e.g. if their first-call JIT
+    compile is too slow or the local CUDA toolchain can't build them)."""
     cap = torch.cuda.get_device_capability(dev)
+    if backend.startswith("flashinfer") and os.environ.get("MOE_NO_FLASHINFER"):
+        return False, "disabled via MOE_NO_FLASHINFER"
     if backend == "triton":
         if not ((9, 0) <= cap < (11, 0)):           # vLLM gates the triton_kernels to SM90..SM100
             return False, f"Triton needs SM90-100, have sm_{cap[0]}{cap[1]}"
@@ -251,6 +256,20 @@ def _backend_supported(backend: str, dev: torch.device) -> tuple[bool, str]:
     return True, ""
 
 
+_flashinfer_announced = False
+
+
+def _announce_flashinfer_jit(backend: str) -> None:
+    """Print a one-time heads-up before the first FlashInfer call: it JIT-compiles its
+    CUTLASS/TRTLLM kernel via nvcc, which can take a few minutes (silent, cached afterward) --
+    otherwise the first sweep point looks hung. Set MOE_NO_FLASHINFER=1 to skip these backends."""
+    global _flashinfer_announced
+    if backend.startswith("flashinfer") and not _flashinfer_announced:
+        _flashinfer_announced = True
+        print("  [note] first FlashInfer MoE call JIT-compiles its kernel (nvcc) — this can take "
+              "a few minutes; it is cached afterward. Set MOE_NO_FLASHINFER=1 to skip FlashInfer.")
+
+
 def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
     """Best kernel for one MoE point: tries each candidate for the scheme (bf16: BF16_BACKENDS,
     mxfp4: MXFP4_BACKENDS), skips the unsupported (caching architectural failures in
@@ -264,6 +283,7 @@ def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
             _moe_disabled.add(backend)
             print(f"  [skip] moe {backend}: {why}")
             continue
+        _announce_flashinfer_jit(backend)           # one-time heads-up: first call JIT-compiles
         try:
             fn, bufs = _MOE_BUILDERS[backend](M, E, top_k, H, I, dt, dev)
             ms = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms
