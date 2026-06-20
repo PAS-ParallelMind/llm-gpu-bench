@@ -54,7 +54,10 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 MOE_M_GRID = [1, 4, 16, 64, 256, 1024, 4096]   # x4 steps: T = M*top_k spans 8 .. 32768 at top_k=8
 MOE_E_GRID = [8, 32, 128]
 MOE_H_GRID = [2048, 4096, 8192]             # brackets real hidden (2048, 2880)
-MOE_I_GRID = [512, 1024, 2048, 4096]        # brackets real intermediate (768, 2880)
+# Dense at small I, widening toward the top: efficiency is steepest/lowest there, and TP shards
+# the intermediate dim (I/TP: gpt-oss 2880 -> 360/720, qwen 768 -> 96/192/384), which the old
+# 512-floor extrapolated. ~256 steps in the low end (the prediction-critical region), ~1.5-2x above.
+MOE_I_GRID = [128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]   # brackets TP-sharded intermediates
 MOE_TOPK = 8                                # benchmark top_k; efficiency is keyed on T=M*top_k
 
 # Weight bytes/elem per scheme (mxfp4: 4-bit weight + 1-byte E8M0 scale per 32 elems = 0.53125).
