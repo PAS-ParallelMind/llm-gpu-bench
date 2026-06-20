@@ -164,19 +164,29 @@ since the 4-bit kernels dequant to bf16 tensor cores).
 
 **Both schemes are best-of-backends like attention**: per shape we try every vLLM MoE kernel
 that runs on the GPU, skip the unsupported, keep the fastest, and record which won in
-`shape.backend`. Candidates per scheme:
+`shape.backend` (the label column below). Candidates per scheme:
 
-| scheme | backends (entry) | runs on |
-|---|---|---|
-| bf16 | `fused_experts` (Triton) | any CUDA GPU |
-|  | `flashinfer_cutlass` (`flashinfer_cutlass_fused_moe`) | SM90 / SM100 / SM120 |
-|  | `flashinfer_trtllm` (`trtllm_bf16_moe`) | SM100 (Blackwell) only |
-| mxfp4 | `marlin` (`fused_marlin_moe`) | any CUDA GPU |
-|  | `triton` (`triton_kernel_moe_forward`; OpenAI's `triton_kernels`, used by gpt-oss) | SM90–100 + `triton_kernels` |
+| scheme | `shape.backend` | entry | runs on |
+|---|---|---|---|
+| bf16 | `triton` | vLLM `fused_experts` | any CUDA GPU |
+|  | `flashinfer_cutlass` | `flashinfer_cutlass_fused_moe` | SM90 / SM100 / SM120 |
+|  | `flashinfer_trtllm` | `trtllm_bf16_moe` | SM100 (Blackwell) only |
+| mxfp4 | `marlin` | `fused_marlin_moe` | any CUDA GPU |
+|  | `triton` | `triton_kernel_moe_forward` (OpenAI's `triton_kernels`, used by gpt-oss) | SM90–100 + `triton_kernels` |
 
-On Ada (RTX 4090) only `fused_experts` (bf16) / `marlin` (mxfp4) run; the FlashInfer and OAI
-Triton kernels are picked up on Hopper/Blackwell. The bf16 FlashInfer kernels matter because
-vLLM ranks them *above* Triton for bf16 on those GPUs, so best-of reflects what serving picks.
+On Ada (RTX 4090) only the `triton`/`marlin` kernels run; the FlashInfer and OAI kernels are
+picked up on Hopper/Blackwell. The bf16 FlashInfer kernels matter because vLLM ranks them
+*above* Triton for bf16 on those GPUs, so best-of reflects what serving picks. (`shape.backend`
+`triton` means vLLM's `fused_experts` in the bf16 file and the OAI kernel in the mxfp4 file —
+two different Triton kernels, disambiguated by the result file.)
+
+**Each backend is measured tuned, the way vLLM serves it** — not at its default/fallback, which
+would skew best-of. FlashInfer profiles its best tactic in a `flashinfer.autotune()` pass per
+shape; `fused_experts` sweeps a curated set of Triton configs (the model-agnostic grid ships no
+tuned JSON, so it would otherwise run vLLM's default heuristic). `MOE_NO_TUNE=1` skips tuning
+(fast but biased); `MOE_NO_FLASHINFER=1` skips the FlashInfer backends (e.g. if their first-call
+JIT compile is too slow). The first FlashInfer call JIT-compiles its kernel via nvcc — a one-time
+multi-minute cost, cached afterward (a heads-up prints so it doesn't look hung).
 
 > **Backends not covered.** Still excluded (see the `moe.py` docstring): the **mxfp4 FlashInfer
 > TRTLLM/CUTLASS** backends and **DeepGEMM** — the mxfp4 FlashInfer weights need a per-expert

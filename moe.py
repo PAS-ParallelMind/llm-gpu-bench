@@ -6,18 +6,25 @@ GEMMs under *uniform* routing (the analytic roofline) but measure the real kerne
 + routing land in the efficiency factor -- same roofline / measured split as gemm/attn.
 
 Both schemes are **best-of-backends like attention**: per shape we try every vLLM MoE kernel
-that runs on this GPU, skip the unsupported, keep the FASTEST, and record which won. The two
-schemes differ only in the **weight byte model** (FLOPs are identical -- all the 4-bit kernels
-dequant to bf16 and run the same bf16 tensor cores):
+that runs on this GPU, skip the unsupported, keep the FASTEST, and record which won (the result
+`shape.backend` label is in parentheses below). The two schemes differ only in the **weight byte
+model** (FLOPs are identical -- all the 4-bit kernels dequant to bf16 and run the same bf16
+tensor cores):
   * bf16  (w16a16; weights 2 bytes/elem):
-        - fused_experts      Triton grouped GEMM, any CUDA GPU (always available).
-        - flashinfer_cutlass FlashInfer CUTLASS,  SM90 / SM100 / SM120.
-        - flashinfer_trtllm  FlashInfer TRTLLM-Gen, SM100 (Blackwell) only.
+        - "triton"             vLLM fused_experts grouped GEMM, any CUDA GPU (always available).
+        - "flashinfer_cutlass" FlashInfer CUTLASS,  SM90 / SM100 / SM120.
+        - "flashinfer_trtllm"  FlashInfer TRTLLM-Gen, SM100 (Blackwell) only.
   * mxfp4 (w4a16; 4-bit weights ~0.53 bytes/elem incl. E8M0 scale/32, bf16 activations):
-        - marlin             fused_marlin_moe, any CUDA GPU.
-        - triton             OAI triton_kernels gpt-oss kernel, SM90-100 + triton_kernels.
-  On Ada (RTX 4090) only fused_experts (bf16) / marlin (mxfp4) run; the FlashInfer and OAI
-  Triton kernels are picked up on Hopper/Blackwell.
+        - "marlin"             fused_marlin_moe, any CUDA GPU.
+        - "triton"             OAI triton_kernels gpt-oss kernel, SM90-100 + triton_kernels.
+  On Ada (RTX 4090) only the "triton"/"marlin" kernels run; the FlashInfer and OAI kernels are
+  picked up on Hopper/Blackwell.
+
+  Each backend is measured the way vLLM *serves* it -- tuned, not at its default/fallback:
+  FlashInfer profiles its best tactic in a flashinfer autotune() pass; fused_experts sweeps a
+  curated set of Triton configs (the model-agnostic grid has no shipped tuned JSON). Without
+  this the untuned backend loses unfairly. Set MOE_NO_TUNE=1 to skip tuning (fast, but biased)
+  or MOE_NO_FLASHINFER=1 to skip the FlashInfer backends entirely.
 
   Still uncovered (see README): the mxfp4 FlashInfer TRTLLM/CUTLASS backends + DeepGEMM (the
   mxfp4 FlashInfer weights need a block-scale swizzle, future work), and all activation-
@@ -38,7 +45,7 @@ from dataclasses import dataclass
 import torch
 
 from timing import measure, progress
-from vllm.model_executor.layers.fused_moe import fused_experts
+from vllm.model_executor.layers.fused_moe import fused_experts, override_config
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
@@ -65,6 +72,28 @@ MXFP4_GROUP = 32                            # E8M0 scale group size
 BF16_BACKENDS = ["fused_experts", "flashinfer_cutlass", "flashinfer_trtllm"]
 MXFP4_BACKENDS = ["marlin", "triton"]
 _moe_disabled: set = set()                  # backends unsupported on this GPU/install -> not retried
+
+# Result-file label per internal backend id. The bf16 Triton kernel is vLLM's `fused_experts`,
+# but we report it as "triton" (its own gate/builder keep the unambiguous internal id, so it
+# never collides with the mxfp4 "triton" = OAI triton_kernels kernel in the other result file).
+_BACKEND_LABEL = {"fused_experts": "triton"}
+
+# Curated Triton fused_experts configs swept per shape (the default config is also a candidate,
+# so tuning never loses to it). vLLM ships tuned JSON only for specific model shapes; for the
+# model-agnostic grid it falls back to a default heuristic, so we tune like serving would.
+# Keys are what override_config feeds fused_experts. Invalid configs (shared-mem) are skipped.
+_TRITON_MOE_CONFIGS = [
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4},
+    {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4},
+    {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 4},
+    {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "num_warps": 4, "num_stages": 4},
+    {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32, "GROUP_SIZE_M": 8, "num_warps": 4, "num_stages": 4},
+    {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 8, "num_warps": 8, "num_stages": 4},
+    {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 32, "num_warps": 8, "num_stages": 4},
+    {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4},
+    {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
+    {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 3},
+]
 
 
 def make_mxfp4_weight(N: int, K: int, device: torch.device, group_size: int = MXFP4_GROUP):
@@ -281,6 +310,49 @@ def _flashinfer_tune(fn) -> None:
     torch.cuda.synchronize()
 
 
+def _under_config(cfg: dict, fn):
+    """Wrap fn so each call runs under override_config(cfg) -- forces a Triton fused_experts
+    config (cfg swap is just a global set/restore, negligible vs the kernel)."""
+    def run():
+        with override_config(cfg):
+            return fn()
+    return run
+
+
+def _smem_bytes(cfg: dict, elem: int = 2) -> int:
+    """Approx Triton MoE-GEMM shared memory: A[M,K] + B[N,K] tiles, multi-buffered by stages."""
+    return cfg["BLOCK_SIZE_K"] * (cfg["BLOCK_SIZE_M"] + cfg["BLOCK_SIZE_N"]) * elem * cfg["num_stages"]
+
+
+def _triton_best_config(fn, dev, iters, warmup):
+    """Sweep the curated Triton configs (+ the default) for this fused_experts call and return
+    the fastest as an override dict, or None if the default wins. vLLM ships no tuned JSON for
+    the model-agnostic grid, so without this we'd time the default heuristic while serving tunes
+    -- which would unfairly bias best-of toward the (already tuned) FlashInfer backends.
+
+    Configs whose tiles overflow the device's shared memory are skipped *before* launch: such a
+    launch raises Triton OutOfResources whose CUDA error can surface deferred (past the per-config
+    try) and poison the next measurement. A sync-backstop catches any that still slip through."""
+    smem_limit = getattr(torch.cuda.get_device_properties(dev), "shared_memory_per_block_optin", 0)
+    best_ms, best = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms, None  # default
+    for cfg in _TRITON_MOE_CONFIGS:
+        if smem_limit and _smem_bytes(cfg) > smem_limit:   # would overflow -> never launch it
+            continue
+        try:
+            ms = measure(_under_config(cfg, fn), device=dev, iters=iters, warmup=warmup).median_ms
+            torch.cuda.synchronize(dev)            # surface any deferred error here, inside the try
+        except Exception:                          # invalid for this shape (resources) -> drop it
+            try:
+                torch.cuda.synchronize(dev)
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+            continue
+        if ms < best_ms:
+            best_ms, best = ms, cfg
+    return best
+
+
 def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
     """Best kernel for one MoE point: tries each candidate for the scheme (bf16: BF16_BACKENDS,
     mxfp4: MXFP4_BACKENDS), skips the unsupported (caching architectural failures in
@@ -297,8 +369,13 @@ def _best_moe_call(M, E, top_k, H, I, dt, dev, *, quant, iters, warmup):
         _announce_flashinfer_jit(backend)           # one-time heads-up: first call JIT-compiles
         try:
             fn, bufs = _MOE_BUILDERS[backend](M, E, top_k, H, I, dt, dev)
-            if backend.startswith("flashinfer"):   # tune the tactic first (else it runs fallback)
-                _flashinfer_tune(fn)
+            if not os.environ.get("MOE_NO_TUNE"):  # tune each backend like serving (MOE_NO_TUNE=1 skips)
+                if backend == "fused_experts":      # sweep Triton configs (no shipped JSON for the grid)
+                    cfg = _triton_best_config(fn, dev, max(iters // 4, 5), max(warmup // 4, 2))
+                    if cfg is not None:
+                        fn = _under_config(cfg, fn)
+                elif backend.startswith("flashinfer"):   # else FlashInfer runs its slow fallback tactic
+                    _flashinfer_tune(fn)
             ms = measure(fn, device=dev, iters=iters, warmup=warmup).median_ms
         except Exception as e:
             torch.cuda.empty_cache()
@@ -339,7 +416,7 @@ class MoERecord:
     quant: str              # "bf16" or "mxfp4" (weight scheme)
     median_ms: float
     regime: str             # "C" compute-bound, "M" memory-bound (weight-read)
-    backend: str = ""       # winning kernel ("fused_experts" / "marlin" / "triton")
+    backend: str = ""       # winning kernel, result label ("triton" / "marlin" / "flashinfer_*")
     tflops: float = 0.0     # achieved compute throughput
     gbps: float = 0.0       # achieved memory throughput
     efficiency: float = 0.0
@@ -372,16 +449,17 @@ def run_moe_sweep(Ms, Es, Hs, Is, top_k, *, c_peak, b_peak, quant="bf16", dtype=
             continue
         del fn, bufs
         torch.cuda.empty_cache()
+        label = _BACKEND_LABEL.get(backend, backend)  # result label (fused_experts -> "triton")
         flops = moe_flops(M, top_k, H, I)
         nbytes = moe_bytes(M, E, top_k, H, I, quant)
         tc, tm = flops / C, nbytes / B
         sec = ms * 1e-3
         recs.append(MoERecord(M=M, E=E, top_k=top_k, H=H, I=I, quant=quant, median_ms=ms,
-                    regime="C" if tc > tm else "M", backend=backend,
+                    regime="C" if tc > tm else "M", backend=label,
                     tflops=flops / sec / 1e12 if sec > 0 else 0.0,
                     gbps=nbytes / sec / 1e9 if sec > 0 else 0.0,
                     efficiency=(max(tc, tm) / sec) if sec > 0 else 0.0))
-        pbar.set_postfix_str(f"M={M} E={E} H={H} I={I} [{backend}]")
+        pbar.set_postfix_str(f"M={M} E={E} H={H} I={I} [{label}]")
         pbar.update(1)
     pbar.close()
     return recs
