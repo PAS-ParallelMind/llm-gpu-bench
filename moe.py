@@ -199,7 +199,8 @@ def _bf16_flashinfer_trtllm_call(M, E, top_k, H, I, dt, dev):
         gemm1_weights=w1, gemm2_weights=w2, num_experts=E, top_k=top_k,
         n_group=None, topk_group=None, intermediate_size=I,
         local_expert_offset=0, local_num_experts=E, routed_scaling_factor=None,
-        routing_method_type=RoutingMethodType.Renormalize)
+        routing_method_type=RoutingMethodType.Renormalize,
+        tune_max_num_tokens=max(M, 1))   # tune for this shape's M (default is 8192); cf. cutlass
     return fn, (x, logits, w1, w2)
 
 
