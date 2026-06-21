@@ -81,18 +81,32 @@ def _run_moe(args, props, dtype: str) -> None:
           [r.result() for r in recs])
 
 
+def _run_allreduce(args) -> None:
+    """NCCL all-reduce: achieved bandwidth vs message bytes, swept over world sizes 1,2,4,...×N.
+    Multi-process (one rank per GPU); does not use --c-peak/--b-peak (set --bus-peak for efficiency)."""
+    from allreduce import run_full_allreduce_sweep, write_results
+    gpu = torch.cuda.get_device_name(0)
+    print(f"\n== allreduce (NCCL, {torch.cuda.device_count()} GPUs, world sizes 1,2,4,...) ==")
+    n_gpus, ws_list, results = run_full_allreduce_sweep(
+        iters=args.iters, warmup=args.warmup, bus_peak=args.bus_peak)
+    write_results(args.out or "results/allreduce.json", gpu, n_gpus, args.bus_peak, results)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bench", default="gemm_bf16",
-                    choices=["gemm_bf16", "gemm_fp16", "attn_bf16", "moe_bf16", "moe_mxfp4"],
-                    help="which benchmark to run (<op>_<dtype>).")
+                    choices=["gemm_bf16", "gemm_fp16", "attn_bf16", "moe_bf16", "moe_mxfp4",
+                             "allreduce"],
+                    help="which benchmark to run (<op>_<dtype>; allreduce is dtype-agnostic).")
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--shapes", nargs="+", default=None,
                     help="Subset of SHAPES keys (gemm only; default: all).")
-    ap.add_argument("--c-peak", type=float, required=True,
-                    help="Theoretical compute peak TFLOP/s (e.g. RTX 4090: 165).")
-    ap.add_argument("--b-peak", type=float, required=True,
-                    help="Theoretical memory bandwidth GB/s (e.g. RTX 4090: 1008).")
+    ap.add_argument("--c-peak", type=float, default=None,
+                    help="Theoretical compute peak TFLOP/s (gemm/attn/moe; e.g. RTX 4090: 165).")
+    ap.add_argument("--b-peak", type=float, default=None,
+                    help="Theoretical memory bandwidth GB/s (gemm/attn/moe; e.g. RTX 4090: 1008).")
+    ap.add_argument("--bus-peak", type=float, default=0.0,
+                    help="Interconnect GB/s for all-reduce efficiency (NVLink: H100 ~900, GB200 ~1800).")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--out", type=str, default=None)
@@ -100,6 +114,12 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available — this benchmark needs a GPU.")
+
+    if args.bench == "allreduce":
+        _run_allreduce(args)
+        return
+    if args.c_peak is None or args.b_peak is None:
+        raise SystemExit(f"--bench {args.bench} needs --c-peak and --b-peak.")
 
     dev = args.device
     props = torch.cuda.get_device_properties(dev)
