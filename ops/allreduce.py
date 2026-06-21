@@ -12,11 +12,12 @@ GPU count (W=1 has no communication, so it's skipped), over a sweep of message s
 size runs as its own set of one-process-per-
 GPU NCCL ranks (torch.multiprocessing.spawn; rank r -> cuda:r).
 
-The all-reduce is captured into a CUDA graph and we time graph replays -- exactly how vLLM runs
-the decode TP collective, so the per-collective time is launch-free (no host launch / event /
-dispatch overhead), the faithful serving number. (NCCL is warmed up on a side stream first, as
-graph capture of a cold collective fails.) A barrier precedes timing and the latency is maxed
-across ranks. latency_ms is the prediction target (the predictor interpolates it directly in
+A batch of all-reduces is captured into a CUDA graph and we time graph replays -- exactly how vLLM
+runs the decode TP collective, so the per-collective time is launch-free (no host launch / event /
+dispatch overhead), the faithful serving number. Batching several collectives per graph amortizes
+even the per-replay graph launch (one replay runs them back-to-back), which matters in the
+latency-bound regime. (NCCL is warmed up on a side stream first, as graph capture of a cold
+collective fails.) A barrier precedes timing and the latency is maxed across ranks. latency_ms is the prediction target (the predictor interpolates it directly in
 log-bytes per world size, so no interconnect peak is needed); algbw = bytes/time and busbw =
 algbw*2(W-1)/W (the algorithm-independent bus bandwidth) are kept as informational "achieved
 GB/s" columns.
@@ -41,6 +42,8 @@ import torch.multiprocessing as mp
 # prefill chunks ~[8192, hidden] (tens of MiB, bandwidth-bound).
 SIZES = [4096, 16384, 65536, 262144, 1 << 20, 1 << 22, 1 << 24, 1 << 26, 1 << 28]
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+_GRAPH_BATCH = 16   # all-reduces captured per CUDA graph; one replay runs them back-to-back so the
+                    # graph launch is amortized over the batch (iters/_GRAPH_BATCH replays are timed).
 
 
 def _free_port() -> int:
@@ -91,18 +94,21 @@ def _worker(rank: int, world_size: int, byte_sizes: list[int], dtype_name: str,
 
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
-                dist.all_reduce(t)              # one collective captured into the graph
+                for _ in range(_GRAPH_BATCH):   # a batch of collectives per graph, so one replay
+                    dist.all_reduce(t)          # runs them back-to-back launch-free (as serving does)
+            g.replay()                          # warm the replay path
             torch.cuda.synchronize(dev)
             dist.barrier()
 
+            reps = max(1, round(iters / _GRAPH_BATCH))
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            for _ in range(iters):
-                g.replay()                      # launch-free graph replay, as serving does
+            for _ in range(reps):
+                g.replay()
             end.record()
             end.synchronize()
-            ms = start.elapsed_time(end) / iters
+            ms = start.elapsed_time(end) / (_GRAPH_BATCH * reps)
 
             lat = torch.tensor([ms], device=dev)
             dist.all_reduce(lat, op=dist.ReduceOp.MAX)   # collective latency = slowest rank
