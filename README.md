@@ -233,7 +233,7 @@ kernel per shape is recorded in each result's `shape.backend`.
 
 ## Files
 
-    timing.py             CUDA-event timing, L2 flush, robust stats      (torch)
+    timing.py             CUPTI on-device kernel timing, L2 flush, robust stats   (torch + cupti-python)
     gemm.py               GEMM sweep (bf16/fp16 via torch F.linear), model-agnostic grid, roofline (torch)
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
     moe.py                MoE sweep: best-of-backends bf16 (Triton/FlashInfer) + mxfp4 (Marlin/Triton), two-grouped-GEMM roofline (torch+vLLM)
@@ -265,9 +265,10 @@ or one at a time:
     python validate_predict.py --bench moe_bf16                   # moe accuracy (best of Triton/FlashInfer)
     python validate_predict.py --bench moe_mxfp4                  # moe accuracy (best of Marlin/Triton)
 
-The sweep needs torch + a CUDA GPU (mxfp4 needs vLLM/Marlin, attn needs FlashInfer);
-prediction does not. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is
-memory-bound (B_peak only).
+The sweep needs torch + a CUDA GPU + **`cupti-python`** (timing reads CUPTI on-device kernel
+timestamps — install the build matching your CUDA toolkit; there is no CUDA-event fallback, for
+accuracy on small ops); mxfp4 needs vLLM/Marlin, attn needs FlashInfer. Prediction needs none of
+this. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is memory-bound (B_peak only).
 
 ## Output format
 
