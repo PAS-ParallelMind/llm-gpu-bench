@@ -12,11 +12,14 @@ GPU count (W=1 has no communication, so it's skipped), over a sweep of message s
 size runs as its own set of one-process-per-
 GPU NCCL ranks (torch.multiprocessing.spawn; rank r -> cuda:r).
 
-Timing follows nccl-tests: a barrier, then a batch of all-reduces timed with CUDA events (launch
-amortized over the batch -- matching vLLM's CUDA-graph decode), divided by the batch, maxed across
-ranks. latency_ms is the prediction target (the predictor interpolates it directly in log-bytes
-per world size, so no interconnect peak is needed); algbw = bytes/time and busbw = algbw*2(W-1)/W
-(the algorithm-independent bus bandwidth) are kept as informational "achieved GB/s" columns.
+The all-reduce is captured into a CUDA graph and we time graph replays -- exactly how vLLM runs
+the decode TP collective, so the per-collective time is launch-free (no host launch / event /
+dispatch overhead), the faithful serving number. (NCCL is warmed up on a side stream first, as
+graph capture of a cold collective fails.) A barrier precedes timing and the latency is maxed
+across ranks. latency_ms is the prediction target (the predictor interpolates it directly in
+log-bytes per world size, so no interconnect peak is needed); algbw = bytes/time and busbw =
+algbw*2(W-1)/W (the algorithm-independent bus bandwidth) are kept as informational "achieved
+GB/s" columns.
 
 Single node only (device_count sees the local node); multi-node needs a torchrun launcher.
 
@@ -73,8 +76,22 @@ def _worker(rank: int, world_size: int, byte_sizes: list[int], dtype_name: str,
         for nbytes in byte_sizes:
             n_elem = max(1, nbytes // dt.itemsize)
             t = torch.ones(n_elem, dtype=dt, device=dev)
-            for _ in range(warmup):
-                dist.all_reduce(t)
+
+            # Capture the all-reduce into a CUDA graph and time replays -- this is how vLLM runs
+            # the decode TP collective, so it's the faithful number (launch fully amortized). NCCL
+            # needs the collective warmed up on a side stream first (to set up its buffers and
+            # connections); capturing a cold collective fails.
+            side = torch.cuda.Stream(dev)
+            side.wait_stream(torch.cuda.current_stream(dev))
+            with torch.cuda.stream(side):
+                for _ in range(warmup):
+                    dist.all_reduce(t)
+            torch.cuda.current_stream(dev).wait_stream(side)
+            torch.cuda.synchronize(dev)
+
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                dist.all_reduce(t)              # one collective captured into the graph
             torch.cuda.synchronize(dev)
             dist.barrier()
 
@@ -82,7 +99,7 @@ def _worker(rank: int, world_size: int, byte_sizes: list[int], dtype_name: str,
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             for _ in range(iters):
-                dist.all_reduce(t)              # back-to-back: launch amortized over the batch
+                g.replay()                      # launch-free graph replay, as serving does
             end.record()
             end.synchronize()
             ms = start.elapsed_time(end) / iters
@@ -91,7 +108,7 @@ def _worker(rank: int, world_size: int, byte_sizes: list[int], dtype_name: str,
             dist.all_reduce(lat, op=dist.ReduceOp.MAX)   # collective latency = slowest rank
             if rank == 0:
                 out_list.append((n_elem * dt.itemsize, lat.item()))
-            del t
+            del g, t
             torch.cuda.empty_cache()
     finally:
         dist.destroy_process_group()
