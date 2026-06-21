@@ -7,8 +7,9 @@ size). The cost is set by bytes moved and the interconnect, not the dtype -- a 1
 takes the same time whether it's bf16 or fp32 -- so this measures **achieved bandwidth vs message
 size**, keyed on bytes (the bench is just `allreduce`, not per-dtype).
 
-Detects the GPUs on the node and benchmarks NCCL all-reduce for world sizes 1, 2, 4, ... up to the
-GPU count, over a sweep of message sizes. Each world size runs as its own set of one-process-per-
+Detects the GPUs on the node and benchmarks NCCL all-reduce for world sizes 2, 4, 8, ... up to the
+GPU count (W=1 has no communication, so it's skipped), over a sweep of message sizes. Each world
+size runs as its own set of one-process-per-
 GPU NCCL ranks (torch.multiprocessing.spawn; rank r -> cuda:r).
 
 Timing follows nccl-tests: a barrier, then a batch of all-reduces timed with CUDA events (launch
@@ -19,7 +20,7 @@ per world size, so no interconnect peak is needed); algbw = bytes/time and busbw
 
 Single node only (device_count sees the local node); multi-node needs a torchrun launcher.
 
-    python allreduce.py                          # auto-detect GPUs, sweep W=1,2,4,...
+    python allreduce.py                          # auto-detect GPUs, sweep W=2,4,8,...
 """
 from __future__ import annotations
 
@@ -48,12 +49,13 @@ def _free_port() -> int:
 
 
 def world_sizes_for(n_gpus: int) -> list[int]:
-    """1, 2, 4, ... up to n_gpus (and n_gpus itself if it isn't a power of two)."""
-    ws, w = [], 1
+    """2, 4, 8, ... up to n_gpus (and n_gpus itself if it isn't a power of two). World size 1 is
+    dropped -- it has no communication; all-reduce needs >= 2 GPUs (empty list on a 1-GPU node)."""
+    ws, w = [], 2
     while w <= n_gpus:
         ws.append(w)
         w *= 2
-    if n_gpus not in ws:
+    if n_gpus >= 2 and n_gpus not in ws:
         ws.append(n_gpus)
     return ws
 
@@ -116,13 +118,15 @@ def _record(world_size: int, nbytes: int, ms: float) -> dict:
 def run_full_allreduce_sweep(*, sizes: list[int] | None = None, dtype: str = "bf16",
                              iters: int = 50, warmup: int = 20,
                              max_gpus: int | None = None, verbose: bool = True):
-    """Detect GPUs and sweep NCCL all-reduce over world sizes 1,2,4,...×N and message sizes.
+    """Detect GPUs and sweep NCCL all-reduce over world sizes 2,4,8,...×N and message sizes.
     Returns (n_gpus, world_sizes, results) where results is a list of per-(W, bytes) dicts."""
     sizes = sizes or SIZES
     n_gpus = torch.cuda.device_count()
     if max_gpus:
         n_gpus = min(n_gpus, max_gpus)
     ws_list = world_sizes_for(n_gpus)
+    if not ws_list:
+        raise SystemExit(f"all-reduce needs >= 2 GPUs (found {n_gpus}).")
     results: list[dict] = []
     for W in ws_list:
         if verbose:

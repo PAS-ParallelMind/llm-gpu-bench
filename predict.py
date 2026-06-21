@@ -246,8 +246,10 @@ class Predictor:
     # --- all-reduce: interpolate measured latency directly (log bytes per world size) ---
     def allreduce_latency_ms(self, nbytes: int, world_size: int) -> float:
         """TP all-reduce latency for `nbytes` over `world_size` ranks: interpolate the measured
-        latency curve in log(bytes) for that W (no roofline -- latency is measured directly).
-        W between measured world sizes interpolates linearly in W; W=1 is the no-comm baseline."""
+        latency curve in log(bytes) for that W (no roofline -- latency is measured directly). W
+        between measured world sizes interpolates linearly in W; W<=1 has no collective (0 cost)."""
+        if world_size <= 1:
+            return 0.0                          # single rank -> no all-reduce (W=1 is not measured)
         curves = self.ar_curves
         if not curves:
             raise ValueError("no all-reduce curves loaded")

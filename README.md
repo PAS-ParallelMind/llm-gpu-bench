@@ -237,7 +237,7 @@ kernel per shape is recorded in each result's `shape.backend`.
     gemm.py               GEMM sweep (bf16/fp16 via torch F.linear), model-agnostic grid, roofline (torch)
     attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
     moe.py                MoE sweep: best-of-backends bf16 (Triton/FlashInfer) + mxfp4 (Marlin/Triton), two-grouped-GEMM roofline (torch+vLLM)
-    allreduce.py          NCCL all-reduce sweep over world sizes 1,2,4,… × message sizes (the TP collective) (torch+NCCL)
+    allreduce.py          NCCL all-reduce sweep over world sizes 2,4,8,… × message sizes (the TP collective) (torch+NCCL)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
     run_all.sh            run every benchmark for one GPU (--c-peak/--b-peak)         (bash)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM / all-reduce log-bytes) (stdlib)
@@ -257,7 +257,7 @@ or one at a time:
     python run.py --bench attn_bf16  --c-peak 165 --b-peak 1008   # FlashInfer attn (best of kernels)
     python run.py --bench moe_bf16   --c-peak 165 --b-peak 1008   # MoE bf16 (best of Triton/FlashInfer)
     python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (best of Marlin/Triton)
-    python run.py --bench allreduce                              # NCCL all-reduce, world sizes 1,2,4,…×N (auto-detects GPUs)
+    python run.py --bench allreduce                              # NCCL all-reduce, world sizes 2,4,8,…×N (auto-detects GPUs)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
     python predict.py --results results/attn_bf16.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
     python predict.py --results results/moe_bf16.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
