@@ -139,7 +139,7 @@ def _record(world_size: int, nbytes: int, ms: float) -> dict:
 
 
 def run_full_allreduce_sweep(*, sizes: list[int] | None = None, dtype: str = "bf16",
-                             iters: int = 50, warmup: int = 20,
+                             iters: int = 256, warmup: int = 20,
                              max_gpus: int | None = None, verbose: bool = True):
     """Detect GPUs and sweep NCCL all-reduce over world sizes 2,4,8,...×N and message sizes.
     Returns (n_gpus, world_sizes, results) where results is a list of per-(W, bytes) dicts."""
@@ -183,7 +183,8 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dtype", default="bf16", choices=list(_DTYPES),
                     help="allocation dtype (cost is byte-driven; this is just the measurement vehicle).")
-    ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--iters", type=int, default=256,
+                    help="total timed collectives (graph replays = iters/16).")
     ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--max-gpus", type=int, default=None, help="cap the world size (default: all).")
     ap.add_argument("--sizes", type=int, nargs="+", default=None, help="message sizes in bytes.")

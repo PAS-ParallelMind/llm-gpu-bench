@@ -104,10 +104,15 @@ def main() -> None:
                     help="Theoretical compute peak TFLOP/s (gemm/attn/moe; e.g. RTX 4090: 165).")
     ap.add_argument("--b-peak", type=float, default=None,
                     help="Theoretical memory bandwidth GB/s (gemm/attn/moe; e.g. RTX 4090: 1008).")
-    ap.add_argument("--iters", type=int, default=100)
-    ap.add_argument("--warmup", type=int, default=25)
+    ap.add_argument("--iters", type=int, default=None,
+                    help="timed iterations (default: gemm/attn/moe 100; allreduce 256).")
+    ap.add_argument("--warmup", type=int, default=None, help="warmup iterations (default: 25).")
     ap.add_argument("--out", type=str, default=None)
     args = ap.parse_args()
+    if args.iters is None:
+        args.iters = 256 if args.bench == "allreduce" else 100
+    if args.warmup is None:
+        args.warmup = 25
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA not available — this benchmark needs a GPU.")
