@@ -13,16 +13,13 @@ GPU NCCL ranks (torch.multiprocessing.spawn; rank r -> cuda:r).
 
 Timing follows nccl-tests: a barrier, then a batch of all-reduces timed with CUDA events (launch
 amortized over the batch -- matching vLLM's CUDA-graph decode), divided by the batch, maxed across
-ranks. We report
-  algbw = bytes / time                         (what the activation tensor sees)
-  busbw = algbw * 2*(W-1)/W                     (bus bandwidth: algorithm-independent, vs link peak)
-With --bus-peak (interconnect GB/s, e.g. H100 NVLink ~900, GB200 NVLink ~1800), efficiency =
-busbw / bus_peak.
+ranks. latency_ms is the prediction target (the predictor interpolates it directly in log-bytes
+per world size, so no interconnect peak is needed); algbw = bytes/time and busbw = algbw*2(W-1)/W
+(the algorithm-independent bus bandwidth) are kept as informational "achieved GB/s" columns.
 
 Single node only (device_count sees the local node); multi-node needs a torchrun launcher.
 
     python allreduce.py                          # auto-detect GPUs, sweep W=1,2,4,...
-    python allreduce.py --bus-peak 900           # H100 NVLink, report efficiency
 """
 from __future__ import annotations
 
@@ -106,18 +103,18 @@ def _run_world(world_size: int, sizes: list[int], dtype: str, iters: int, warmup
     return list(out)
 
 
-def _record(world_size: int, nbytes: int, ms: float, bus_peak: float) -> dict:
+def _record(world_size: int, nbytes: int, ms: float) -> dict:
+    """latency_ms is the prediction target (interpolated directly); algbw/busbw are informational
+    (achieved GB/s -- busbw = algbw * 2(W-1)/W is the algorithm-independent bus bandwidth)."""
     sec = ms * 1e-3
-    algbw = nbytes / sec / 1e9 if sec > 0 else 0.0                # GB/s the tensor sees
-    busfac = 2.0 * (world_size - 1) / world_size                  # ring all-reduce bus factor (0 at W=1)
-    busbw = algbw * busfac
-    eff = (busbw / bus_peak) if (bus_peak and busfac > 0) else 0.0
+    algbw = nbytes / sec / 1e9 if sec > 0 else 0.0               # GB/s the tensor sees
+    busfac = 2.0 * (world_size - 1) / world_size                # ring all-reduce bus factor (0 at W=1)
     return {"shape": {"world_size": world_size, "bytes": nbytes}, "latency_ms": ms,
-            "algbw_gbps": algbw, "busbw_gbps": busbw, "efficiency": eff}
+            "algbw_gbps": algbw, "busbw_gbps": algbw * busfac}
 
 
 def run_full_allreduce_sweep(*, sizes: list[int] | None = None, dtype: str = "bf16",
-                             iters: int = 50, warmup: int = 20, bus_peak: float = 0.0,
+                             iters: int = 50, warmup: int = 20,
                              max_gpus: int | None = None, verbose: bool = True):
     """Detect GPUs and sweep NCCL all-reduce over world sizes 1,2,4,...×N and message sizes.
     Returns (n_gpus, world_sizes, results) where results is a list of per-(W, bytes) dicts."""
@@ -130,24 +127,22 @@ def run_full_allreduce_sweep(*, sizes: list[int] | None = None, dtype: str = "bf
     for W in ws_list:
         if verbose:
             print(f"\n== world_size {W} ==")
-            print(f"  {'bytes':>12} {'latency_ms':>11} {'algbw_GB/s':>11} {'busbw_GB/s':>11}"
-                  + ("  eff" if bus_peak else ""))
+            print(f"  {'bytes':>12} {'latency_ms':>11} {'algbw_GB/s':>11} {'busbw_GB/s':>11}")
         for nbytes, ms in _run_world(W, sizes, dtype, iters, warmup):
-            r = _record(W, nbytes, ms, bus_peak)
+            r = _record(W, nbytes, ms)
             results.append(r)
             if verbose:
-                eff = f"  {r['efficiency']:.2f}" if bus_peak else ""
-                print(f"  {nbytes:>12} {ms:>11.4f} {r['algbw_gbps']:>11.1f} "
-                      f"{r['busbw_gbps']:>11.1f}{eff}")
+                print(f"  {nbytes:>12} {ms:>11.4f} {r['algbw_gbps']:>11.1f} {r['busbw_gbps']:>11.1f}")
     return n_gpus, ws_list, results
 
 
-def write_results(out: str, gpu: str, n_gpus: int, bus_peak: float, results: list[dict]) -> None:
-    """Write the unified result JSON (hardware carries n_gpus + bus_peak, not c/b peak)."""
+def write_results(out: str, gpu: str, n_gpus: int, results: list[dict]) -> None:
+    """Write the unified result JSON (hardware carries n_gpus; the predictor interpolates
+    latency_ms directly, so there is no bus/compute peak to record)."""
     out_p = Path(out)
     out_p.parent.mkdir(parents=True, exist_ok=True)
     out_p.write_text(json.dumps({
-        "hardware": {"gpu": gpu, "n_gpus": n_gpus, "bus_peak_gbps": bus_peak},
+        "hardware": {"gpu": gpu, "n_gpus": n_gpus},
         "operation": {"bench": "allreduce", "impl": {
             "torch": torch.__version__,
             "nccl": ".".join(map(str, torch.cuda.nccl.version()))}},
@@ -163,8 +158,6 @@ def main() -> None:
                     help="allocation dtype (cost is byte-driven; this is just the measurement vehicle).")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=20)
-    ap.add_argument("--bus-peak", type=float, default=0.0,
-                    help="interconnect GB/s for efficiency (NVLink: H100 ~900, GB200 ~1800).")
     ap.add_argument("--max-gpus", type=int, default=None, help="cap the world size (default: all).")
     ap.add_argument("--sizes", type=int, nargs="+", default=None, help="message sizes in bytes.")
     ap.add_argument("--out", type=str, default="results/allreduce.json")
@@ -176,8 +169,8 @@ def main() -> None:
     print(f"GPU: {gpu} x{torch.cuda.device_count()} | NCCL all-reduce (achieved bandwidth vs bytes)")
     n_gpus, ws_list, results = run_full_allreduce_sweep(
         sizes=args.sizes, dtype=args.dtype, iters=args.iters, warmup=args.warmup,
-        bus_peak=args.bus_peak, max_gpus=args.max_gpus)
-    write_results(args.out, gpu, n_gpus, args.bus_peak, results)
+        max_gpus=args.max_gpus)
+    write_results(args.out, gpu, n_gpus, results)
 
 
 if __name__ == "__main__":

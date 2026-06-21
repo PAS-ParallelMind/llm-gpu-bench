@@ -59,6 +59,7 @@ class Predictor:
     moe_eff: dict = field(default_factory=dict)                  # {(T,E,H,I): eff}  T=M*top_k
     moe_axes: tuple = field(default_factory=tuple)               # (Ts, Es, Hs, Is)
     moe_bytes_model: dict[str, float] = field(default_factory=lambda: {"w": 2.0, "a": 2.0})
+    ar_curves: dict = field(default_factory=dict)               # {W: sorted [(log bytes, latency_ms)]} (allreduce)
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Predictor":
@@ -68,13 +69,21 @@ class Predictor:
         if "hardware" not in d:
             return cls._from_legacy(d)
         hw, opn = d["hardware"], d["operation"]
-        b_peak, c_peak = float(hw["b_peak_gbps"]), float(hw["c_peak_tflops"])
-        op, _, dtype = opn["bench"].partition("_")          # gemm/attn/moe ; bf16/fp16/mxfp4
+        b_peak = float(hw.get("b_peak_gbps", 0) or 0)       # absent for allreduce (no roofline)
+        c_peak = float(hw.get("c_peak_tflops", 0) or 0)
+        op, _, dtype = opn["bench"].partition("_")          # gemm/attn/moe/allreduce ; bf16/fp16/mxfp4
         results = d["results"]
 
         def sh(r):
             return r["shape"]
 
+        if op == "allreduce":
+            curves: dict[int, list] = {}
+            for r in results:
+                s = sh(r)
+                curves.setdefault(s["world_size"], []).append((math.log(s["bytes"]), r["latency_ms"]))
+            return cls(b_peak=b_peak, op="allreduce",
+                       ar_curves={w: sorted(c) for w, c in curves.items()})
         if op == "attn":
             dec = [r for r in results if sh(r).get("kind") == "decode"]
             pre = [r for r in results if sh(r).get("kind") == "prefill"]
@@ -234,6 +243,29 @@ class Predictor:
     def moe_latency_ms(self, M, E, top_k, H, I):
         return self.moe_roofline_ms(M, E, top_k, H, I) / self.moe_efficiency(M, E, top_k, H, I)
 
+    # --- all-reduce: interpolate measured latency directly (log bytes per world size) ---
+    def allreduce_latency_ms(self, nbytes: int, world_size: int) -> float:
+        """TP all-reduce latency for `nbytes` over `world_size` ranks: interpolate the measured
+        latency curve in log(bytes) for that W (no roofline -- latency is measured directly).
+        W between measured world sizes interpolates linearly in W; W=1 is the no-comm baseline."""
+        curves = self.ar_curves
+        if not curves:
+            raise ValueError("no all-reduce curves loaded")
+        lx = math.log(nbytes)
+        if world_size in curves:
+            return _interp1d(curves[world_size], lx)
+        ws = sorted(curves)
+        if world_size <= ws[0]:
+            return _interp1d(curves[ws[0]], lx)
+        if world_size >= ws[-1]:
+            return _interp1d(curves[ws[-1]], lx)
+        for i in range(1, len(ws)):
+            if world_size <= ws[i]:
+                w0, w1 = ws[i - 1], ws[i]
+                l0, l1 = _interp1d(curves[w0], lx), _interp1d(curves[w1], lx)
+                return l0 + (l1 - l0) * (world_size - w0) / (w1 - w0)
+        return _interp1d(curves[ws[-1]], lx)
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -248,12 +280,25 @@ def main() -> None:
     ap.add_argument("--head", nargs=3, type=int, metavar=("H", "H_kv", "D"), default=[32, 8, 128])
     # moe: expert config (E, top_k, H, I); sweeps --M
     ap.add_argument("--moe", nargs=4, type=int, metavar=("E", "top_k", "H", "I"), default=None)
+    # all-reduce: world size; sweeps --bytes
+    ap.add_argument("--allreduce", type=int, metavar="WORLD_SIZE", default=None)
+    ap.add_argument("--bytes", nargs="+", type=int,
+                    default=[1 << 14, 1 << 18, 1 << 20, 1 << 22, 1 << 24, 1 << 26])
     args = ap.parse_args()
 
     path = args.results or "results/gemm_bf16.json"
     if not Path(path).exists():
         raise SystemExit(f"no {path} — pass --results or run run.py")
     p = Predictor.from_json(path)
+
+    if p.op == "allreduce":
+        W = args.allreduce or max(p.ar_curves)
+        print(f"{path}  |  all-reduce  |  world sizes {sorted(p.ar_curves)}")
+        print(f"predict NCCL all-reduce, world_size={W}\n")
+        print(f"  {'bytes':>12} {'predicted':>11}")
+        for b in args.bytes:
+            print(f"  {b:>12} {p.allreduce_latency_ms(b, W):>9.4f}ms")
+        return
 
     if p.op == "attn":
         H, H_kv, D = args.head

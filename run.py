@@ -82,14 +82,13 @@ def _run_moe(args, props, dtype: str) -> None:
 
 
 def _run_allreduce(args) -> None:
-    """NCCL all-reduce: achieved bandwidth vs message bytes, swept over world sizes 1,2,4,...×N.
-    Multi-process (one rank per GPU); does not use --c-peak/--b-peak (set --bus-peak for efficiency)."""
+    """NCCL all-reduce: achieved bandwidth + latency vs message bytes, over world sizes 1,2,4,...×N.
+    Multi-process (one rank per GPU); does not use --c-peak/--b-peak (latency is predicted directly)."""
     from allreduce import run_full_allreduce_sweep, write_results
     gpu = torch.cuda.get_device_name(0)
     print(f"\n== allreduce (NCCL, {torch.cuda.device_count()} GPUs, world sizes 1,2,4,...) ==")
-    n_gpus, ws_list, results = run_full_allreduce_sweep(
-        iters=args.iters, warmup=args.warmup, bus_peak=args.bus_peak)
-    write_results(args.out or "results/allreduce.json", gpu, n_gpus, args.bus_peak, results)
+    n_gpus, ws_list, results = run_full_allreduce_sweep(iters=args.iters, warmup=args.warmup)
+    write_results(args.out or "results/allreduce.json", gpu, n_gpus, results)
 
 
 def main() -> None:
@@ -105,8 +104,6 @@ def main() -> None:
                     help="Theoretical compute peak TFLOP/s (gemm/attn/moe; e.g. RTX 4090: 165).")
     ap.add_argument("--b-peak", type=float, default=None,
                     help="Theoretical memory bandwidth GB/s (gemm/attn/moe; e.g. RTX 4090: 1008).")
-    ap.add_argument("--bus-peak", type=float, default=0.0,
-                    help="Interconnect GB/s for all-reduce efficiency (NVLink: H100 ~900, GB200 ~1800).")
     ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--warmup", type=int, default=25)
     ap.add_argument("--out", type=str, default=None)
