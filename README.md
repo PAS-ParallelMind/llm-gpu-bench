@@ -48,7 +48,7 @@ Two approaches ruled out **by measurement**, not opinion:
 
 ## The predictor
 
-- **Grid** (`gemm.py`) — a dense octave grid, K ∈ [128 … 16384], N ∈ [128 …
+- **Grid** (`ops/gemm.py`) — a dense octave grid, K ∈ [128 … 16384], N ∈ [128 …
   131072] (88 pairs) × an M-sweep [1 … 4096]. Model-agnostic: keyed on no model's
   shapes. Real projections fall inside the hull (K∈[768,8192], N∈[1536,~201k]); N
   reaches 131072 so lmhead is bracketed, not extrapolated.
@@ -188,7 +188,7 @@ tuned JSON, so it would otherwise run vLLM's default heuristic). `MOE_NO_TUNE=1`
 JIT compile is too slow). The first FlashInfer call JIT-compiles its kernel via nvcc — a one-time
 multi-minute cost, cached afterward (a heads-up prints so it doesn't look hung).
 
-> **Backends not covered.** Still excluded (see the `moe.py` docstring): the **mxfp4 FlashInfer
+> **Backends not covered.** Still excluded (see the `ops/moe.py` docstring): the **mxfp4 FlashInfer
 > TRTLLM/CUTLASS** backends and **DeepGEMM** — the mxfp4 FlashInfer weights need a per-expert
 > block-scale swizzle (reusable from vLLM's converter, but not yet wired up); and all
 > **activation-quantized w4a8 variants** (FlashInfer MXFP8, DeepGEMM FP8, AITER) — a *different
@@ -233,11 +233,12 @@ kernel per shape is recorded in each result's `shape.backend`.
 
 ## Files
 
+    ops/                  the kernel-operation sweeps (each a grid + roofline):
+      ops/gemm.py           GEMM sweep (bf16/fp16 via torch F.linear), model-agnostic grid, roofline (torch)
+      ops/attn.py           FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
+      ops/moe.py            MoE sweep: best-of-backends bf16 (Triton/FlashInfer) + mxfp4 (Marlin/Triton), two-grouped-GEMM roofline (torch+vLLM)
+      ops/allreduce.py      NCCL all-reduce sweep over world sizes 2,4,8,… × message sizes (the TP collective) (torch+NCCL)
     timing.py             CUPTI on-device kernel timing, L2 flush, robust stats   (torch + cupti-python)
-    gemm.py               GEMM sweep (bf16/fp16 via torch F.linear), model-agnostic grid, roofline (torch)
-    attn.py               FlashInfer attn sweep (best of fa2/fa3/cutlass/trtllm-gen per shape) (torch+flashinfer)
-    moe.py                MoE sweep: best-of-backends bf16 (Triton/FlashInfer) + mxfp4 (Marlin/Triton), two-grouped-GEMM roofline (torch+vLLM)
-    allreduce.py          NCCL all-reduce sweep over world sizes 2,4,8,… × message sizes (the TP collective) (torch+NCCL)
     run.py                run a benchmark (--bench <op>_<dtype>), dump JSON (torch)
     run_all.sh            run every benchmark for one GPU (--c-peak/--b-peak)         (bash)
     predict.py            latency predictor (gemm trilinear / attn hybrid / moe grouped-GEMM / all-reduce log-bytes) (stdlib)

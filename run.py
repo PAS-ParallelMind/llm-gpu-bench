@@ -24,7 +24,7 @@ from pathlib import Path
 
 import torch
 
-from gemm import BYTES_MODEL, DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
+from ops.gemm import BYTES_MODEL, DEFAULT_MS, SHAPES, roofline_residual, run_gemm_sweep
 
 
 def _dump(out, gpu, c_peak, b_peak, bench, impl, bytes_model, results) -> None:
@@ -42,7 +42,7 @@ def _dump(out, gpu, c_peak, b_peak, bench, impl, bytes_model, results) -> None:
 def _run_attn(args, props, dtype: str) -> None:
     """Flash-attention (FlashInfer, best of kernels): decode KV-byte curve + prefill grid."""
     import flashinfer
-    from attn import run_full_attn_sweep
+    from ops.attn import run_full_attn_sweep
     print("\n== attn (FlashInfer, paged KV, best of backends) ==")
     decode, grid = run_full_attn_sweep(c_peak=args.c_peak, b_peak=args.b_peak, dtype=dtype,
                                        device=args.device, iters=args.iters, warmup=args.warmup)
@@ -62,7 +62,7 @@ def _run_moe(args, props, dtype: str) -> None:
     """MoE: token-routed grouped GEMM, two-grouped-GEMM roofline. dtype selects the scheme:
     bf16 -> fused_experts (Triton); mxfp4 -> fused_marlin_moe (w4a16 Marlin)."""
     import vllm
-    from moe import WEIGHT_BYTES, run_full_moe_sweep
+    from ops.moe import WEIGHT_BYTES, run_full_moe_sweep
     quant = dtype                                      # "bf16" or "mxfp4"
     label = {"bf16": "fused_experts Triton", "mxfp4": "fused_marlin_moe w4a16"}[quant]
     print(f"\n== moe[{quant}] (vLLM {label}, token-routed grouped GEMM) ==")
@@ -84,7 +84,7 @@ def _run_moe(args, props, dtype: str) -> None:
 def _run_allreduce(args) -> None:
     """NCCL all-reduce: achieved bandwidth + latency vs message bytes, over world sizes 2,4,8,...×N.
     Multi-process (one rank per GPU); does not use --c-peak/--b-peak (latency is predicted directly)."""
-    from allreduce import run_full_allreduce_sweep, write_results
+    from ops.allreduce import run_full_allreduce_sweep, write_results
     gpu = torch.cuda.get_device_name(0)
     print(f"\n== allreduce (NCCL, {torch.cuda.device_count()} GPUs, world sizes 2,4,8,...) ==")
     n_gpus, ws_list, results = run_full_allreduce_sweep(iters=args.iters, warmup=args.warmup)

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gemm import run_gemm_sweep
+from ops.gemm import run_gemm_sweep
 from predict import Predictor
 
 # GEMM: real projections — the grid (gemm.SHAPES) is keyed on none of these.
@@ -122,7 +122,7 @@ def validate_gemm(args, dtype: str) -> None:
 
 
 def validate_attn(args) -> None:
-    import attn
+    import ops.attn as attn
     path = args.results or "results/attn_bf16.json"
     pred = Predictor.from_json(path)
 
@@ -144,7 +144,7 @@ def validate_attn(args) -> None:
 
 def validate_mixed(args) -> None:
     """Mixed prefill+decode steps: does the step compose as t_prefill + t_decode?"""
-    import attn
+    import ops.attn as attn
     path = args.results or "results/attn_bf16.json"     # the attn sweep grid
     pred = Predictor.from_json(path)
 
@@ -174,7 +174,7 @@ def validate_mixed(args) -> None:
 
 
 def validate_moe(args, quant: str) -> None:
-    import moe
+    import ops.moe as moe
     path = args.results or f"results/moe_{quant}.json"
     pred = Predictor.from_json(path)
 
