@@ -56,8 +56,10 @@ MOE_E_GRID = [8, 32, 128]
 MOE_H_GRID = [2048, 4096, 8192]             # brackets real hidden (2048, 2880)
 # Dense at small I, widening toward the top: efficiency is steepest/lowest there, and TP shards
 # the intermediate dim (I/TP: gpt-oss 2880 -> 360/720, qwen 768 -> 96/192/384), which the old
-# 512-floor extrapolated. ~256 steps in the low end (the prediction-critical region), ~1.5-2x above.
-MOE_I_GRID = [128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]   # brackets TP-sharded intermediates
+# 512-floor extrapolated. Reaches 64 so qwen 768 at TP8 (I=96) is bracketed, not clamped; ~256
+# steps in the low end (the prediction-critical region), ~1.5-2x above. (mxfp4/Marlin needs
+# 128-aligned I, so it skips I=64 in the sweep -- mxfp4 shapes are 128-padded and never query below.)
+MOE_I_GRID = [64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]   # brackets TP-sharded intermediates
 MOE_TOPK = 8                                # benchmark top_k; efficiency is keyed on T=M*top_k
 
 # Weight bytes/elem per scheme (mxfp4: 4-bit weight + 1-byte E8M0 scale per 32 elems = 0.53125).
