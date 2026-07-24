@@ -38,9 +38,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-# Message sizes in BYTES: 4 KiB .. 256 MiB. Decode TP all-reduces ~[1, hidden] (KiB, latency-bound);
-# prefill chunks ~[8192, hidden] (tens of MiB, bandwidth-bound).
-SIZES = [4096, 16384, 65536, 262144, 1 << 20, 1 << 22, 1 << 24, 1 << 26, 1 << 28]
+# Message sizes in BYTES: 4 KiB .. 256 MiB, in ×2 octaves. Decode TP all-reduces ~[1, hidden] (KiB,
+# latency-bound); prefill chunks ~[8192, hidden] (tens of MiB, bandwidth-bound). The grid is ×2 (not
+# ×4) because in the bandwidth-bound regime latency ∝ bytes (convex in log-bytes), so the predictor's
+# linear log-bytes interpolation over a coarse ×4 gap systematically overshoots (~14%); ×2 octaves
+# (matching the gemm/moe grids) quarter that chord error to a few % — validate_predict.py --bench
+# allreduce measures it.
+SIZES = [1 << e for e in range(12, 29)]     # 4 KiB, 8 KiB, ..., 256 MiB
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 _GRAPH_BATCH = 16   # all-reduces captured per CUDA graph; one replay runs them back-to-back so the
                     # graph launch is amortized over the batch (iters/_GRAPH_BATCH replays are timed).
@@ -126,6 +130,21 @@ def _run_world(world_size: int, sizes: list[int], dtype: str, iters: int, warmup
     mp.spawn(_worker, args=(world_size, sizes, dtype, iters, warmup, _free_port(), out),
              nprocs=world_size, join=True)
     return list(out)
+
+
+def measure_allreduce_ms(world_size: int, byte_sizes: list[int], *, dtype: str = "bf16",
+                         iters: int = 256, warmup: int = 20) -> dict[int, float]:
+    """Measure NCCL all-reduce latency (ms) for specific message byte sizes at one world size,
+    returning {bytes: latency_ms}. Spawns `world_size` one-per-GPU ranks (needs that many GPUs).
+
+    The public single-world entry (run_full_allreduce_sweep sweeps all world sizes and the octave
+    SIZES grid); this times arbitrary byte sizes at a chosen W, so validate_predict.py can measure
+    real TP-collective sizes the grid never sampled. Even byte counts (LLM activations are
+    tokens*hidden*2) round-trip exactly (n_elem = bytes//itemsize)."""
+    if world_size > torch.cuda.device_count():
+        raise RuntimeError(f"world_size {world_size} needs {world_size} GPUs "
+                           f"(found {torch.cuda.device_count()}).")
+    return {nbytes: ms for nbytes, ms in _run_world(world_size, list(byte_sizes), dtype, iters, warmup)}
 
 
 def _record(world_size: int, nbytes: int, ms: float) -> dict:

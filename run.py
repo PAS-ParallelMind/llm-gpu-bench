@@ -8,7 +8,7 @@
 --bench is <op>_<dtype>: gemm_bf16 / gemm_fp16 go through torch's F.linear (cuBLAS /
 cuBLASLt / CUTLASS per shape); attn_bf16 sweeps flash-attention (FlashInfer, paged KV; best
 of its fa2/fa3/cutlass/trtllm-gen kernels per shape) — a decode KV-byte curve plus a prefill
-(S_q, S_kv, R·H) × D grid; moe_bf16 / moe_mxfp4 sweep the fused-MoE grouped GEMM (Triton /
+(q_len, kv_len, total_heads) × head_dim grid; moe_bf16 / moe_mxfp4 sweep the fused-MoE grouped GEMM (Triton /
 Marlin). Each writes its own results file.
 
 GEMM and prefill attention need the theoretical roofline ceiling via --c-peak (TFLOP/s)

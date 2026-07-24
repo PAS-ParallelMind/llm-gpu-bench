@@ -91,35 +91,36 @@ kernels are picked up automatically, no code change.
 
 The roofline (FLOPs, bytes) is physics and kernel-independent; only the efficiency depends on
 the kernel. The **efficiency has two physics regimes that want different scale variables**, so
-we model them separately and route on `S_q` inside one `attn_latency_ms`:
+we model them separately and route on `q_len` inside one `attn_latency_ms`:
 
-**Decode (`S_q = 1`)** — 1 query token per request reading the whole KV cache, *always*
-memory-bound (arithmetic intensity = 2·(H/H_kv)/elem, the GQA ratio, far below the ridge).
-Efficiency depends only on the **total KV bytes** streamed — not on head config
-(H, H_kv, D), request count, or how the bytes split across requests' contexts (a skewed
-mixed batch matches a uniform one with the same total KV bytes). One **1-D curve
+**Decode (`q_len = 1`)** — 1 query token per request reading the whole KV cache, *always*
+memory-bound (arithmetic intensity = 2·(n_heads/n_kv_heads)/elem, the GQA ratio, far below the
+ridge). Efficiency depends only on the **total KV bytes** streamed — not on head config
+(n_heads, n_kv_heads, head_dim), request count, or how the bytes split across requests' contexts
+(a skewed mixed batch matches a uniform one with the same total KV bytes). One **1-D curve
 `eff = f(KV bytes)`** predicts decode for any model and any continuous batch:
 
-    t = (KV_bytes / B_peak) / f(KV_bytes),   KV_bytes = 2·elem·Σ_i ⌈L_i/16⌉·16·H_kv·D
+    t = (KV_bytes / B_peak) / f(KV_bytes),   KV_bytes = 2·elem·Σ_i ⌈kv_len_i/16⌉·16·n_kv_heads·head_dim
 
-The curve is swept over (R requests, context L) so it spans KV bytes up to the saturation
-plateau — **0.01 (small) → 0.95 (multi-GB KV)** — and the overlapping R·L points double as a
-check that efficiency really collapses on total KV bytes. Paged-KV reads saturate HBM more
+The curve is swept over (n_req requests, context kv_len) so it spans KV bytes up to the saturation
+plateau — **0.01 (small) → 0.95 (multi-GB KV)** — and the overlapping n_req·kv_len points double as
+a check that efficiency really collapses on total KV bytes. Paged-KV reads saturate HBM more
 slowly than GEMM's contiguous weight read, so it's its own curve.
 
-**Prefill / chunked (`S_q > 1`)** — a batched causal GEMM (per-head QKᵀ then PV) over
-R·H heads. Efficiency is a **3-D surface over (S_q, S_kv, R·H) per head-dim D** (H_kv
-washes out in this compute regime; R·H is the parallelism axis and collapses on the
-product). The roofline is the causal trapezoid:
+**Prefill / chunked (`q_len > 1`)** — a batched causal GEMM (per-head QKᵀ then PV) over
+total_heads = n_req·n_heads. Efficiency is a **3-D surface over (q_len, kv_len, total_heads) per
+head-dim** (n_kv_heads washes out in this compute regime; total_heads is the parallelism axis and
+collapses on the product). The roofline is the causal trapezoid:
 
-    FLOPs = 4·H·D·R·(S_q·S_kv − S_q(S_q−1)/2);  bytes = 2·elem·R·(S_q·H·D + S_kv·H_kv·D)
-    t = max(FLOPs/C_peak, bytes/B_peak) / f(S_q, S_kv, R·H, D)
+    FLOPs = 4·n_heads·head_dim·n_req·(q_len·kv_len − q_len(q_len−1)/2)
+    bytes = 2·elem·n_req·(q_len·n_heads·head_dim + kv_len·n_kv_heads·head_dim)
+    t = max(FLOPs/C_peak, bytes/B_peak) / f(q_len, kv_len, total_heads, head_dim)
 
-**Why hybrid, not one grid.** Decode efficiency scales with `R·S_kv·H_kv·D` (KV bytes);
-prefill with `R·H` (parallelism) — *different* functions of R and H. A single shared
-grid was tried and forced to drop one or the other: it pulled gpt-oss decode (H=64) to
-~30% error because decode doesn't scale with R·H. Measured, not assumed — so decode keeps
-its KV-byte curve and prefill keeps its (S_q, S_kv, R·H, D) grid.
+**Why hybrid, not one grid.** Decode efficiency scales with `n_req·kv_len·n_kv_heads·head_dim` (KV
+bytes); prefill with `total_heads` (parallelism) — *different* functions of n_req and n_heads. A
+single shared grid was tried and forced to drop one or the other: it pulled gpt-oss decode
+(n_heads=64) to ~30% error because decode doesn't scale with total_heads. Measured, not assumed — so
+decode keeps its KV-byte curve and prefill keeps its (q_len, kv_len, total_heads, head_dim) grid.
 
 Accuracy on real head configs (gpt-oss 64/8/64, Qwen 32/4/128) × 8 cases spanning
 decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`:
@@ -127,7 +128,7 @@ decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`
     latency error:  median 2.6%   mean 6.0%   p90 12%   (roofline-only baseline: median 20%)
 
 - **Decode** lands ~0–11% (mixed-batch decode ~0%); model-agnostic across head config.
-- **Single-request transition** is the floor: full prefill at S_q=S_kv≈512 (R=1) hits
+- **Single-request transition** is the floor: full prefill at q_len=kv_len≈512 (n_req=1) hits
   ~30–44% — the compute-ramp where the kernel crosses from memory- to compute-bound, steep
   between octave grid points, analogous to GEMM's transition sag. Batched and longer cases
   sit at 1–7%.
@@ -139,9 +140,9 @@ decode / full prefill / chunked prefill, `validate_predict.py --bench attn_bf16`
 ### Continuous batching (mixed prefill + decode)
 
 vLLM's FlashInfer backend **splits a step** into a `BatchDecode` and a `BatchPrefill` kernel
-(`split_decodes_and_prefills`, threshold `S_q=1`), launched back-to-back on one stream — so
+(`split_decodes_and_prefills`, threshold `q_len=1`), launched back-to-back on one stream — so
 decode keeps its dedicated split-KV kernel and a mixed step is exactly `t_prefill + t_decode`.
-Measured on real continuous-batching steps, `validate_predict.py --bench attn_mixed`:
+Measured on real continuous-batching steps (mixed prefill+decode `BatchPrefill`+`BatchDecode`):
 
     step latency vs  t_prefill + t_decode:   median 0.8%   mean 1.8%   max 7.1%
 
@@ -231,6 +232,33 @@ byte model swapped — per-expert Marlin weights via `moe.make_mxfp4_weight`, Tr
 vLLM's `_swizzle_mxfp4` — and the predictor reads `moe_bytes_model` from the JSON. The winning
 kernel per shape is recorded in each result's `shape.backend`.
 
+## all-reduce (NCCL — the TP collective)
+
+The fifth sweep, and the one op with **no roofline**. Tensor-parallel serving all-reduces the
+`[tokens, hidden]` activation across the TP ranks twice per layer — pure critical-path overhead. Its
+cost is set by the interconnect and message **bytes** (dtype-independent: a 1 MiB all-reduce costs
+the same in bf16 or fp32), so the sweep measures **latency vs message size** over world sizes 2,4,8,…
+and the predictor **interpolates the measured latency directly** in log-bytes (no theoretical peak to
+normalize — an earlier bus-peak/efficiency split was dropped as it added nothing). Timed via CUDA-graph
+replay of a batch of collectives, exactly as vLLM runs the decode TP all-reduce.
+
+Validated on **real TP collectives** the grid never sampled — a real model's hidden dim × a realistic
+token count gives `tokens·hidden·2` bytes, landing between grid points (`validate_predict.py --bench
+allreduce`, real decode-batch→prefill-chunk activation sizes, 2×RTX 4090 W=2):
+
+    latency error:  median 3%   (bandwidth-roofline baseline: median ~48%)
+
+- The roofline (a single achieved-bandwidth ceiling) is right only at the bandwidth-bound plateau; it
+  under-predicts small **latency-bound** decode collectives toward zero (~97% error). The measured
+  curve captures the fixed-latency floor and the ramp — where real decode lives.
+- **Grid density matters here.** In the bandwidth-bound regime latency ∝ bytes (convex in log-bytes),
+  so linear log-bytes interpolation over the original ×4-octave byte grid over-shot by ~14%. Densifying
+  to **×2 octaves** (matching the gemm/moe grids) quartered that chord error to a few % — the
+  validation is what surfaced it. The floor is the smallest decode messages (sub-0.02 ms, noise-bound),
+  which contribute ~nothing to real latency.
+- **Verified range.** With 2 GPUs only world size 2 is exercised (byte-interpolation only); the W axis
+  interpolates linearly between measured world sizes and needs a larger node to hold out a TP degree.
+
 ## Files
 
     ops/                  the kernel-operation sweeps (each a grid + roofline):
@@ -260,14 +288,14 @@ or one at a time:
     python run.py --bench moe_mxfp4  --c-peak 165 --b-peak 1008   # MoE w4a16 (best of Marlin/Triton)
     python run.py --bench allreduce                              # NCCL all-reduce, world sizes 2,4,8,…×N (auto-detects GPUs)
     python predict.py --shape 2880 5120                           # gemm: latency vs M
-    python predict.py --results results/attn_bf16.json --attn 4 1 8192 --head 32 4 128  # attn (R Sq Skv)
+    python predict.py --results results/attn_bf16.json --attn 4 1 8192 --head 32 4 128  # attn (n_req q_len kv_len)
     python predict.py --results results/moe_bf16.json --moe 128 8 2048 768  # moe (E top_k H I) vs M
     python predict.py --results results/allreduce.json --allreduce 8        # all-reduce latency vs bytes (W=8)
     python validate_predict.py --bench gemm_bf16                  # gemm accuracy
     python validate_predict.py --bench attn_bf16                  # attention accuracy
-    python validate_predict.py --bench attn_mixed                 # mixed-step composition (t_pf+t_dec)
     python validate_predict.py --bench moe_bf16                   # moe accuracy (best of Triton/FlashInfer)
     python validate_predict.py --bench moe_mxfp4                  # moe accuracy (best of Marlin/Triton)
+    python validate_predict.py --bench allreduce                  # all-reduce accuracy
 
 The sweep needs torch + a CUDA GPU + **`cupti-python`** (timing reads CUPTI on-device kernel
 timestamps — install the build matching your CUDA toolkit; there is no CUDA-event fallback, for
@@ -276,8 +304,7 @@ this. GEMM and prefill attention need `--c-peak`/`--b-peak`; decode is memory-bo
 
 ## Output format
 
-Every benchmark writes the **same JSON schema** (`run.py`'s `_dump`; `predict.py` reads it,
-and still loads pre-unification files):
+Every benchmark writes the **same JSON schema** (`run.py`'s `_dump`; `predict.py` reads it):
 
     {
       "hardware":  { "gpu", "c_peak_tflops", "b_peak_gbps" },
@@ -292,9 +319,9 @@ and still loads pre-unification files):
     }
 
 `shape` carries each op's input dimensions: gemm `{M,K,N}`; moe `{M,E,top_k,H,I}`; attention
-`{kind:"decode", kv_tokens,H_kv,D}` or `{kind:"prefill", Sq,Sk,RH,D}` (one `results` list holds
-both). The efficiency factor is what the predictor interpolates; tflops/gbps/latency are the
-measured throughputs for inspection.
+`{kind:"decode", kv_tokens,n_kv_heads,head_dim}` or `{kind:"prefill", q_len,kv_len,total_heads,head_dim}`
+(one `results` list holds both). The efficiency factor is what the predictor interpolates;
+tflops/gbps/latency are the measured throughputs for inspection.
 
 ## Scope / next
 

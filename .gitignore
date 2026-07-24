@@ -1,6 +1,9 @@
 # benchmark outputs
 results/
 
+# scratch: experiment scripts, one-off results, papers, and other unrelated artifacts
+workspace/
+
 # uv / venv (lives in-tree)
 vllm_env/
 .venv/
