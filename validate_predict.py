@@ -90,7 +90,10 @@ def _attn_cases():
 
 
 # ── MoE: per MoE model, TP shards the intermediate I; EP shards experts E + (uniform) tokens M
-#    (per-rank M = tokens/EP); H stays full. Swept over (TP, EP) × {decode, prefill}. ───────────────
+#    (per-rank M = tokens/EP); H stays full. Swept over (TP, EP) × {decode, prefill}. When EP shrinks
+#    the per-rank expert count below top_k (e.g. mixtral E=8 at EP=8 -> 1 expert), top_k is capped at
+#    the local expert count and the token count rebalanced so the routed-token work (M·top_k) is
+#    preserved — top_k > E is an invalid routing config (out-of-bounds -> illegal memory access). ────
 MOE_PAR = [(1, 1), (2, 1), (4, 1), (8, 1), (1, 2), (1, 4), (1, 8), (2, 2), (2, 4), (4, 2)]   # (tp, ep)
 
 
@@ -100,8 +103,12 @@ def _moe_cases():
             continue
         E, tk, H, I = m["E"], m["tk"], m["h"], m["moe_ffn"]
         for tp, ep in MOE_PAR:
+            E_rank = max(1, E // ep)
+            tk_rank = min(tk, E_rank)                     # EP can't route to more experts than a rank holds
             for M in (1, PREFILL_M):
-                yield (max(1, M // ep), max(1, E // ep), tk, H, I // tp, tp, ep,
+                T_rank = max(1, M // ep) * tk             # routed tokens on the rank (work to preserve)
+                M_rank = max(1, T_rank // tk_rank)
+                yield (M_rank, E_rank, tk_rank, H, I // tp, tp, ep,
                        f"{name} TP{tp}EP{ep} {'dec' if M == 1 else 'pre'}")
 
 
@@ -285,8 +292,15 @@ def validate_moe(args, quant: str) -> None:
             meas = moe.measure_moe_ms(M, E, tk, H, I, quant=quant, device=args.device,
                                       iters=args.iters, warmup=args.warmup)
         except Exception as e:          # unsupported / OOM shape -> skip, don't crash
-            print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} |    -     -  | "
-                  f"skip ({str(e).splitlines()[0][:30]})")
+            msg = str(e).splitlines()[0]
+            # A device-side fault (illegal access / assert) kills the CUDA context: every later
+            # shape would fail the same way, so abort the bench instead of cascading fake skips.
+            if "illegal memory access" in msg or "device-side assert" in msg:
+                print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} |    -     -  | FATAL")
+                print(f"\n  ** device-side CUDA fault on this shape corrupts the context — aborting "
+                      f"moe[{quant}] ({len(pred_all)}/{len(MOE_CASES)} measured). **")
+                break
+            print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} |    -     -  | skip ({msg[:30]})")
             continue
         pms, rms = pred.moe_latency_ms(M, E, tk, H, I), pred.moe_roofline_ms(M, E, tk, H, I)
         pred_all.append(abs(pms - meas) / meas); roof_all.append(abs(rms - meas) / meas)
