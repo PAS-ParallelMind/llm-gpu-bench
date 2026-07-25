@@ -49,7 +49,9 @@ BYTES_MODEL: dict[str, dict[str, float]] = {
 # [768 .. 8192], N in [1536 .. ~201k] (see validate_predict.py).
 # ---------------------------------------------------------------------------
 GRID_K: list[int] = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-GRID_N: list[int] = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
+# N reaches 262144 so lm_head (vocab up to ~201k: gpt-oss 201088, Qwen 151936) is bracketed at
+# TP=1, not extrapolated (at TP>=2 the sharded vocab already falls under 131072).
+GRID_N: list[int] = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
 
 
 def make_grid(
@@ -61,7 +63,7 @@ def make_grid(
 
 SHAPES: dict[str, tuple[int, int]] = make_grid()
 
-DEFAULT_MS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
+DEFAULT_MS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192]   # to the 8192-token chunk budget
 
 
 @dataclass

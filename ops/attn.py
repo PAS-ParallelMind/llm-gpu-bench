@@ -57,8 +57,10 @@ DECODE_CONFIG = {"n_heads": 32, "n_kv_heads": 8, "head_dim": 128}
 # prefill is covered: TP shards heads, so a per-rank config has total_heads = model_heads/TP (e.g. a
 # 32-head model at TP=8 prefills 4 heads on a rank). Those small-total_heads points are realized as
 # one request with n_heads=total_heads (see _rh_vehicle), matching how they run, not clamped to 32.
-ATTN_SQ_GRID = [16, 64, 256, 1024, 4096]
-ATTN_SK_GRID = [16, 64, 256, 1024, 4096, 16384]
+# q_len reaches 8192 (the chunk/full-prefill token budget); kv_len adds 8192 so a full 8192-token
+# prefill (q_len = kv_len = 8192) is a grid node, not interpolated over the 4096->16384 gap.
+ATTN_SQ_GRID = [16, 64, 256, 1024, 4096, 8192]
+ATTN_SK_GRID = [16, 64, 256, 1024, 4096, 8192, 16384]
 ATTN_RH_GRID = [4, 8, 16, 32, 64, 128, 256, 512]
 ATTN_D_GRID = [64, 128, 256]
 

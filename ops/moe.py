@@ -51,7 +51,8 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 
 # Variables: M tokens, E experts, top_k experts/token, H hidden (GEMM K), I intermediate.
 # Model-agnostic grid: routed tokens via M (decode->prefill) x experts E x hidden H x intermediate I.
-MOE_M_GRID = [1, 4, 16, 64, 256, 1024, 4096]   # x4 steps: T = M*top_k spans 8 .. 32768 at top_k=8
+MOE_M_GRID = [1, 4, 16, 64, 256, 1024, 4096, 8192]   # x4 steps: T = M*top_k spans 8 .. 65536 at top_k=8
+                                                     # (8192 reaches an 8192-token chunk at top_k=8)
 MOE_E_GRID = [8, 32, 128]
 MOE_H_GRID = [2048, 4096, 8192]             # brackets real hidden (2048, 2880)
 # Dense at small I, widening toward the top: efficiency is steepest/lowest there, and TP shards
@@ -61,6 +62,13 @@ MOE_H_GRID = [2048, 4096, 8192]             # brackets real hidden (2048, 2880)
 # 128-aligned I, so it skips I=64 in the sweep -- mxfp4 shapes are 128-padded and never query below.)
 MOE_I_GRID = [64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096]   # brackets TP-sharded intermediates
 MOE_TOPK = 8                                # benchmark top_k; efficiency is keyed on T=M*top_k
+# The work axis is T = M*top_k. Sweeping M at a fixed top_k=8 floors T at 8, so the decode step of
+# any model with top_k < 8 (gpt-oss top-4 -> T=4, mixtral top-2 -> T=2) lands BELOW the grid and its
+# efficiency clamps to the T=8 value -- far too high (measured 0.62-0.75 at T=4 vs the 0.79 clamp),
+# which made the predictor systematically optimistic on MoE decode (~-26% median, on every GPU
+# tested). Efficiency is top_k-invariant at fixed T (measured: 1.00x across top_k 2/4/8), so the
+# low-T end is filled by dropping top_k at M=1 -- no new kernel, and the points stay valid T keys.
+MOE_MT_GRID = [(1, 1), (1, 2), (1, 4)] + [(m, MOE_TOPK) for m in MOE_M_GRID]   # (M, top_k)
 
 # Weight bytes/elem per scheme (mxfp4: 4-bit weight + 1-byte E8M0 scale per 32 elems = 0.53125).
 WEIGHT_BYTES = {"bf16": 2.0, "mxfp4": 0.53125}
@@ -434,23 +442,26 @@ class MoERecord:
                 "efficiency": self.efficiency}
 
 
-def run_moe_sweep(Ms, Es, Hs, Is, top_k, *, c_peak, b_peak, quant="bf16", dtype="bf16",
+def run_moe_sweep(MTs, Es, Hs, Is, *, c_peak, b_peak, quant="bf16", dtype="bf16",
                   device: int | torch.device = 0, iters=30, warmup=10):
-    """Sweep the MoE kernel over (M, E, H, I) at one top_k; efficiency = roofline / measured.
-    quant selects the scheme (bf16 fused_experts / mxfp4 fused_marlin_moe) and its byte model."""
+    """Sweep the MoE kernel over (M, top_k) x (E, H, I); efficiency = roofline / measured. `MTs` is
+    a list of (M, top_k) pairs — top_k varies only to reach the low-T end (see MOE_MT_GRID), since
+    efficiency is keyed on T = M*top_k. quant selects the scheme (bf16 fused_experts / mxfp4
+    fused_marlin_moe) and its byte model."""
     C, B = c_peak * 1e12, b_peak * 1e9
     dev = torch.device("cuda", device) if isinstance(device, int) else device
     dt = _DTYPES[dtype]
-    work = [(M, E, H, I) for E in Es for H in Hs for I in Is for M in Ms]
+    work = [(M, top_k, E, H, I) for E in Es for H in Hs for I in Is for M, top_k in MTs]
     recs: list[MoERecord] = []
     pbar = progress(len(work), f"moe[{quant}]")
-    for M, E, H, I in work:
+    for M, top_k, E, H, I in work:
         try:
             ms, backend, fn, bufs = _best_moe_call(M, E, top_k, H, I, dt, dev,
                                                    quant=quant, iters=iters, warmup=warmup)
         except RuntimeError as e:                     # no backend ran (OOM / all shapes rejected)
             torch.cuda.empty_cache()
-            print(f"  [skip pt] moe[{quant}] M={M} E={E} H={H} I={I}: {str(e).splitlines()[0][:50]}")
+            print(f"  [skip pt] moe[{quant}] M={M} tk={top_k} E={E} H={H} I={I}: "
+                  f"{str(e).splitlines()[0][:50]}")
             pbar.update(1)
             continue
         del fn, bufs
@@ -465,13 +476,13 @@ def run_moe_sweep(Ms, Es, Hs, Is, top_k, *, c_peak, b_peak, quant="bf16", dtype=
                     tflops=flops / sec / 1e12 if sec > 0 else 0.0,
                     gbps=nbytes / sec / 1e9 if sec > 0 else 0.0,
                     efficiency=(max(tc, tm) / sec) if sec > 0 else 0.0))
-        pbar.set_postfix_str(f"M={M} E={E} H={H} I={I} [{label}]")
+        pbar.set_postfix_str(f"M={M} tk={top_k} E={E} H={H} I={I} [{label}]")
         pbar.update(1)
     pbar.close()
     return recs
 
 
 def run_full_moe_sweep(*, c_peak, b_peak, quant="bf16", dtype="bf16", device=0, iters=30, warmup=10):
-    return run_moe_sweep(MOE_M_GRID, MOE_E_GRID, MOE_H_GRID, MOE_I_GRID, MOE_TOPK,
+    return run_moe_sweep(MOE_MT_GRID, MOE_E_GRID, MOE_H_GRID, MOE_I_GRID,
                          c_peak=c_peak, b_peak=b_peak, quant=quant, dtype=dtype,
                          device=device, iters=iters, warmup=warmup)
