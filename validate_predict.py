@@ -16,9 +16,17 @@ how much the benchmark data improves the analytic roofline.
     python3 validate_predict.py --bench moe_mxfp4
     python3 validate_predict.py --bench allreduce
 
---csv writes two files: the per-shape table (the given path) and a per-bench summary
-(<stem>_summary.csv) with mean/median/min/max + latency-weighted error for the roofline-only
-baseline and for roofline+efficiency (the grid). Reuse one --csv across benches to accumulate both.
+Errors are recorded SIGNED: (pred − meas) / meas, so the direction is preserved —
+**positive = over-predict** (model says slower than reality), **negative = under-predict**
+(optimistic, the riskier direction for SLO decisions). |error| is derivable from that; the sign is
+not, and the sign is what tells you *under which shapes* the predictor is optimistic (group the CSV
+by bench / tp / ep / decode-vs-prefill to see the pattern).
+
+--csv appends one tidy row per shape (bench, gpu, label, tp, ep, shape, measured/pred/roof ms, and
+the two signed errors). That is the only artifact: every summary statistic — bias, |error|,
+latency-weighted, per-TP or per-operator breakdowns — is derivable from it, so nothing is written
+twice. Reuse one --csv across benches/GPUs to accumulate a single table. The run also prints a
+live summary to the console for immediate feedback.
 """
 from __future__ import annotations
 
@@ -147,12 +155,14 @@ def _gpu_name(args) -> str:
 
 def _row(bench: str, gpu: str, label: str, tp: int, ep: int, shape: str,
          meas: float, pred_ms: float, roof_ms: float) -> dict:
-    """One CSV row (tp/ep = the tensor/expert-parallel degree baked into the shape); relative
-    errors derived from the latencies so they always agree with them."""
+    """One CSV row (tp/ep = the tensor/expert-parallel degree baked into the shape). Errors are
+    SIGNED relative error (pred-meas)/meas — POSITIVE = over-predict (predicted slower than real),
+    NEGATIVE = under-predict (optimistic). Signed is the raw record: |error| is derivable, the
+    direction is not, and the direction is what says *when* the model is optimistic."""
     return {"bench": bench, "gpu": gpu, "label": label.strip(), "tp": tp, "ep": ep, "shape": shape,
             "measured_ms": f"{meas:.6f}", "pred_ms": f"{pred_ms:.6f}", "roof_ms": f"{roof_ms:.6f}",
-            "pred_rel_err": f"{abs(pred_ms - meas) / meas:.6f}",
-            "roof_rel_err": f"{abs(roof_ms - meas) / meas:.6f}"}
+            "pred_rel_err": f"{(pred_ms - meas) / meas:.6f}",
+            "roof_rel_err": f"{(roof_ms - meas) / meas:.6f}"}
 
 
 def _append_csv(path: str, rows: list[dict], columns: list[str]) -> None:
@@ -173,44 +183,36 @@ def _emit_csv(args, rows: list[dict]) -> None:
         _append_csv(args.csv, rows, CSV_COLUMNS)
 
 
-# One summary row per bench (companion CSV): mean/median/min/max (+ latency-weighted) for the
-# roofline-only baseline and for roofline+efficiency (the grid).
-SUMMARY_COLUMNS = ["bench", "gpu", "n_shapes",
-                   "grid_mean", "grid_median", "grid_min", "grid_max", "grid_lat_wt",
-                   "roof_mean", "roof_median", "roof_min", "roof_max", "roof_lat_wt"]
-
-
 def _stats(errs, meas) -> dict:
-    """mean/median/min/max/p90 of the relative errors + the latency-weighted error."""
+    """Distribution of the SIGNED relative error (+ = over-predict, - = under-predict): mean/median/
+    min/max and the over-predicting share (bias), plus |error| mean/median/p90 and the
+    latency-weighted |error| (accuracy magnitude)."""
     a, w = np.asarray(errs), np.asarray(meas)
-    return {"mean": float(a.mean()), "median": float(np.median(a)), "min": float(a.min()),
-            "max": float(a.max()), "p90": float(np.percentile(a, 90)),
-            "lat_wt": float((a * w).sum() / w.sum())}
+    ab = np.abs(a)
+    return {"mean": float(a.mean()), "median": float(np.median(a)),
+            "min": float(a.min()), "max": float(a.max()),
+            "over_frac": float((a > 0).mean()),
+            "abs_mean": float(ab.mean()), "abs_median": float(np.median(ab)),
+            "abs_p90": float(np.percentile(ab, 90)),
+            "lat_wt": float((ab * w).sum() / w.sum())}
 
 
-def _summary(pred_all, roof_all, meas_all) -> tuple[dict, dict]:
-    """Print the error summary and return (grid_stats, roofline_stats)."""
+def _summary(pred_all, roof_all, meas_all) -> None:
+    """Print the error summary (bias + accuracy). Everything here is derivable from the per-shape
+    CSV — this is just live feedback while the bench runs."""
     grid, roof = _stats(pred_all, meas_all), _stats(roof_all, meas_all)
-    print(f"\n  relative latency error over {len(pred_all)} shapes:")
+    print(f"\n  signed relative error (pred−meas)/meas over {len(pred_all)} shapes "
+          f"[+ over-predict (slow) · − under-predict (optimistic)]:")
     for name, s in [("roofline only (no grid)", roof), ("with efficiency grid  ", grid)]:
-        print(f"    {name}:  mean {s['mean']*100:.1f}%  median {s['median']*100:.1f}%  "
-              f"min {s['min']*100:.1f}%  max {s['max']*100:.1f}%  p90 {s['p90']*100:.1f}%")
+        print(f"    {name}:  median {s['median']*100:+.1f}%  mean {s['mean']*100:+.1f}%  "
+              f"range [{s['min']*100:+.1f}% .. {s['max']*100:+.1f}%]  "
+              f"over-predicts {s['over_frac']*100:.0f}% of shapes")
+    print(f"    |error| (accuracy):  grid median {grid['abs_median']*100:.1f}%  "
+          f"mean {grid['abs_mean']*100:.1f}%  p90 {grid['abs_p90']*100:.1f}%"
+          f"   |  roofline median {roof['abs_median']*100:.1f}%")
     # latency-weighted: heavy (high-latency) shapes dominate, reflecting real serving cost.
-    print(f"    latency-weighted (Σ|pred-meas| / Σ meas):  "
+    print(f"    latency-weighted |error| (Σ|pred-meas| / Σ meas):  "
           f"grid {grid['lat_wt']*100:.1f}%   roofline {roof['lat_wt']*100:.1f}%")
-    return grid, roof
-
-
-def _emit_summary(args, bench: str, gpu: str, n: int, grid: dict, roof: dict) -> None:
-    """Append one summary row for this bench to a companion CSV (<stem>_summary.csv)."""
-    if not getattr(args, "csv", None):
-        return
-    p = Path(args.csv)
-    row = {"bench": bench, "gpu": gpu, "n_shapes": n}
-    for prefix, s in [("grid", grid), ("roof", roof)]:
-        for k in ("mean", "median", "min", "max", "lat_wt"):
-            row[f"{prefix}_{k}"] = f"{s[k]:.6f}"
-    _append_csv(str(p.with_name(f"{p.stem}_summary{p.suffix}")), [row], SUMMARY_COLUMNS)
 
 
 def validate_gemm(args, dtype: str) -> None:
@@ -232,14 +234,13 @@ def validate_gemm(args, dtype: str) -> None:
         if meas is None:
             continue
         pms, rms = pred.latency_ms(M, K, N, dtype), pred.roofline_ms(M, K, N, dtype)
-        pred_all.append(abs(pms - meas) / meas); roof_all.append(abs(rms - meas) / meas)
+        pred_all.append((pms - meas) / meas); roof_all.append((rms - meas) / meas)
         meas_all.append(meas)
         rows.append(_row(f"gemm_{dtype}", gpu, label, tp, 1, f"M{M}_K{K}_N{N}", meas, pms, rms))
-        print(f"  {label:30} {M:>5} {K:>6} {N:>7} | {pred_all[-1]*100:>4.0f}% "
-              f"{roof_all[-1]*100:>4.0f}% | {meas:8.3f} ms")
-    grid, roof = _summary(pred_all, roof_all, meas_all)
+        print(f"  {label:30} {M:>5} {K:>6} {N:>7} | {pred_all[-1]*100:>+5.0f}% "
+              f"{roof_all[-1]*100:>+5.0f}% | {meas:8.3f} ms")
+    _summary(pred_all, roof_all, meas_all)
     _emit_csv(args, rows)
-    _emit_summary(args, f"gemm_{dtype}", gpu, len(pred_all), grid, roof)
 
 
 def validate_attn(args) -> None:
@@ -263,15 +264,14 @@ def validate_attn(args) -> None:
             continue
         pms = pred.attn_latency_ms(n_req, q_len, kv_len, n_heads, n_kv_heads, head_dim)
         rms = pred.attn_roofline_ms(n_req, q_len, kv_len, n_heads, n_kv_heads, head_dim)
-        pred_all.append(abs(pms - meas) / meas); roof_all.append(abs(rms - meas) / meas)
+        pred_all.append((pms - meas) / meas); roof_all.append((rms - meas) / meas)
         meas_all.append(meas)
         shape = f"nreq{n_req}_qlen{q_len}_kvlen{kv_len}_nheads{n_heads}_nkvheads{n_kv_heads}_headdim{head_dim}"
         rows.append(_row("attn_bf16", gpu, label, tp, 1, shape, meas, pms, rms))
         print(f"  {label:28} {n_req:>5} {q_len:>5} {kv_len:>6} {f'{n_heads}/{n_kv_heads}/{head_dim}':>9} | "
-              f"{pred_all[-1]*100:>4.0f}% {roof_all[-1]*100:>4.0f}% | {meas:8.4f} ms")
-    grid, roof = _summary(pred_all, roof_all, meas_all)
+              f"{pred_all[-1]*100:>+5.0f}% {roof_all[-1]*100:>+5.0f}% | {meas:8.4f} ms")
+    _summary(pred_all, roof_all, meas_all)
     _emit_csv(args, rows)
-    _emit_summary(args, "attn_bf16", gpu, len(pred_all), grid, roof)
 
 
 def validate_moe(args, quant: str) -> None:
@@ -303,15 +303,14 @@ def validate_moe(args, quant: str) -> None:
             print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} |    -     -  | skip ({msg[:30]})")
             continue
         pms, rms = pred.moe_latency_ms(M, E, tk, H, I), pred.moe_roofline_ms(M, E, tk, H, I)
-        pred_all.append(abs(pms - meas) / meas); roof_all.append(abs(rms - meas) / meas)
+        pred_all.append((pms - meas) / meas); roof_all.append((rms - meas) / meas)
         meas_all.append(meas)
         rows.append(_row(f"moe_{quant}", gpu, label, tp, ep, f"M{M}_E{E}_tk{tk}_H{H}_I{I}", meas, pms, rms))
-        print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} | {pred_all[-1]*100:>4.0f}% "
-              f"{roof_all[-1]*100:>4.0f}% | {meas:8.3f} ms")
+        print(f"  {label:32} {M:>5} {E:>4} {tk:>3} {H:>5} {I:>6} | {pred_all[-1]*100:>+5.0f}% "
+              f"{roof_all[-1]*100:>+5.0f}% | {meas:8.3f} ms")
     if pred_all:
-        grid, roof = _summary(pred_all, roof_all, meas_all)
+        _summary(pred_all, roof_all, meas_all)
         _emit_csv(args, rows)
-        _emit_summary(args, f"moe_{quant}", gpu, len(pred_all), grid, roof)
     else:
         print("\n  (no measurable shapes — all rejected by the kernel)")
 
@@ -346,15 +345,14 @@ def validate_allreduce(args) -> None:
         for tok, hid, b, label in cases:
             meas = measured[b]
             pms, rms = pred.allreduce_latency_ms(b, W), pred.allreduce_roofline_ms(b, W)
-            pred_all.append(abs(pms - meas) / meas); roof_all.append(abs(rms - meas) / meas)
+            pred_all.append((pms - meas) / meas); roof_all.append((rms - meas) / meas)
             meas_all.append(meas)
             rows.append(_row("allreduce", gpu, label, W, 1, f"W{W}_tok{tok}_hid{hid}_bytes{b}", meas, pms, rms))
-            print(f"  {label:24} {tok:>6} {hid:>6} {b:>10} | {pred_all[-1]*100:>4.0f}% "
-                  f"{roof_all[-1]*100:>4.0f}% | {meas:8.4f} ms")
+            print(f"  {label:24} {tok:>6} {hid:>6} {b:>10} | {pred_all[-1]*100:>+5.0f}% "
+                  f"{roof_all[-1]*100:>+5.0f}% | {meas:8.4f} ms")
     if pred_all:
-        grid, roof = _summary(pred_all, roof_all, meas_all)
+        _summary(pred_all, roof_all, meas_all)
         _emit_csv(args, rows)
-        _emit_summary(args, "allreduce", gpu, len(pred_all), grid, roof)
     else:
         print("\n  (no measurable world sizes on this node)")
 
